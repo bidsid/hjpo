@@ -1,22 +1,18 @@
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import jax.numpy as jnp
-from integration import derivative_function, eulers_method, pendulum_ode
-from diffrax import diffeqsolve, ODETerm, SaveAt, ConstantStepSize, PIDController, Solution, Tsit5
-
-
-def u(t):
-    # forcing function
-    return 5
-
-
+from integration import derivative_function, eulers_method, pendulum_ode, u, swingUpU
+from diffrax import diffeqsolve, ODETerm, SaveAt, ConstantStepSize, PIDController, Solution, Tsit5, Heun
 
 if __name__ == "__main__":
     m = 1.0
     b = 0
     L = 1.0
     G = 9.8
-    theta_initial = -jnp.pi/2
+    k = 1
+    umax = 1
+    useSwingUp = True
+    theta_initial = jnp.pi/3
     omega_initial = 0
     t_stop = 10    # seconds to simulate
     dt = 0.01   # time between each sample
@@ -24,7 +20,7 @@ if __name__ == "__main__":
     # states_at_each_time = eulers_method(theta_initial, omega_initial, t, dt, m, L, G, b, u)
     # trying RK4 with diffrax instead
     term = ODETerm(pendulum_ode)
-    solver = Tsit5()
+    solver = Heun()
     sol = diffeqsolve(
         term,
         solver,
@@ -33,7 +29,7 @@ if __name__ == "__main__":
         dt0=dt,
         y0=jnp.array([theta_initial, omega_initial]),
         saveat=SaveAt(ts=t),
-        args=(m, L, G, b, u),
+        args=(m, L, G, b, k, umax, u, swingUpU, useSwingUp),
     )
     theta = sol.ys[:,0]
     omega = sol.ys[:,1]

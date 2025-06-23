@@ -1,5 +1,20 @@
 import jax.numpy as jnp
 
+def u(t):
+    # forcing function
+    return 5
+
+def swingUpU(m, g, l, k, umax, theta, thetadot):
+    E_desired = 2 * m * g * l
+    E_current = 0.5 * m * (l * thetadot)**2 + m * g * l * (1 - jnp.cos(theta))
+    delta_E = E_current - E_desired
+    
+    # output = -k * thetadot**2 * delta_E
+    output = -k * delta_E * jnp.sign(thetadot + 1e-5)
+    output = jnp.clip(output, -umax, umax)
+    
+    return output
+
 # Euler's method to solve the ODE
 def derivative_function(t, state, m, l, g, b, u):
     # state is first the angular position then angular velocity
@@ -30,8 +45,11 @@ def eulers_method(th_in, om_in, t, dt, m, L, G, b, u):
 
 def pendulum_ode(t, y, args):   # for diffrax solvers
     theta, omega = y
-    m, l, g, b, u = args
+    m, l, g, b, k, umax, basicForcing, swingUpForcing, useSwingUp = args
     k = m * g / l
     dtheta = omega
-    domega = (u(t) - b * omega - k * jnp.sin(theta)) / m
+    forcingTerm = basicForcing(t)
+    if useSwingUp:
+        forcingTerm = swingUpForcing(m, g, l, k, umax, theta, omega)
+    domega = (forcingTerm - b * omega - k * jnp.sin(theta)) / m
     return jnp.array([dtheta, domega])
