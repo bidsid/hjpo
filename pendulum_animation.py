@@ -1,8 +1,23 @@
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import jax.numpy as jnp
-from integration import derivative_function, eulers_method, pendulum_ode, u, swingUpU
-from diffrax import diffeqsolve, ODETerm, SaveAt, ConstantStepSize, PIDController, Solution, Tsit5, Heun
+from integration import derivative_function, eulers_method, pendulum_ode
+from diffrax import diffeqsolve, ODETerm, SaveAt, Heun
+
+def u(t, m, g, l, b, k, umax, theta, thetadot):
+    # forcing function
+    return 5
+
+def swingUpU(t, m, g, l, b, k, umax, theta, thetadot):
+    E_desired = 2 * m * g * l
+    E_current = 0.5 * m * (l * thetadot)**2 + m * g * l * (1 - jnp.cos(theta))
+    delta_E = E_current - E_desired
+    
+    # output = -k * thetadot**2 * delta_E
+    output = -k * delta_E * jnp.sign(thetadot + 1e-5)
+    output = jnp.clip(output, -umax, umax)
+    
+    return output
 
 if __name__ == "__main__":
     m = 1.0
@@ -10,14 +25,21 @@ if __name__ == "__main__":
     L = 1.0
     G = 9.8
     k = 1
-    umax = 1
+    umax = 20
     useSwingUp = True
+    forcingFunc = swingUpU if useSwingUp else u
     theta_initial = jnp.pi/3
     omega_initial = 0
     t_stop = 10    # seconds to simulate
     dt = 0.01   # time between each sample
     t = jnp.arange(0, t_stop, dt)
-    # states_at_each_time = eulers_method(theta_initial, omega_initial, t, dt, m, L, G, b, u)
+    
+    # in house integrator
+    # states_at_each_time = eulers_method(theta_initial, omega_initial, t, dt, m, L, G, b, k, umax, forcingFunc)
+    # theta = states_at_each_time[:,0]
+    # omega = states_at_each_time[:,1]
+    # times = t
+
     # trying RK4 with diffrax instead
     term = ODETerm(pendulum_ode)
     solver = Heun()
@@ -29,7 +51,7 @@ if __name__ == "__main__":
         dt0=dt,
         y0=jnp.array([theta_initial, omega_initial]),
         saveat=SaveAt(ts=t),
-        args=(m, L, G, b, k, umax, u, swingUpU, useSwingUp),
+        args=(t, m, G, L, b, k, umax, forcingFunc),
     )
     theta = sol.ys[:,0]
     omega = sol.ys[:,1]
