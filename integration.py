@@ -28,7 +28,7 @@ def eulers_method(th_in, om_in, t, dt, m, L, G, b, k, umax, F):
 
 def pendulum_ode(t, y, args):   # for diffrax solvers
     theta, omega = y
-    t, m, g, l, b, k, umax, F = args
+    m, g, l, b, k, umax, F = args
     spring_constant = m * g / l
     dtheta = omega
     domega = (F(t, m, g, l, b, k, umax, theta, omega) - b * omega - spring_constant * jnp.sin(theta)) / m
