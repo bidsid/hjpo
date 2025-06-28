@@ -33,3 +33,11 @@ def pendulum_ode(t, y, args):   # for diffrax solvers
     dtheta = omega
     domega = (F(t, m, g, l, b, k, umax, theta, omega) - b * omega - spring_constant * jnp.sin(theta)) / m
     return jnp.array([dtheta, domega])
+
+def pendulum_ode_nn(t, y, args):
+    theta, omega = y
+    m, g, l, b, k, umax, F = args
+    spring_constant = m * g / l
+    dtheta = omega
+    domega =  F(jnp.array([t, m, g, l, b, k, umax, theta, omega])) - b * omega - spring_constant * jnp.sin(theta) / m
+    return jnp.array([dtheta, jnp.squeeze(domega)])
