@@ -6,7 +6,7 @@ from diffrax import diffeqsolve, ODETerm, SaveAt, Heun
 
 def u(t, m, g, l, b, k, umax, theta, thetadot):
     # forcing function
-    return jnp.sin(t)
+    return 0
 
 def swingUpU(t, m, g, l, b, k, umax, theta, thetadot):
     E_desired = 2 * m * g * l
@@ -77,11 +77,11 @@ if __name__ == "__main__":
     L = 1.0
     G = 9.8
     k = 1
-    umax = 20
+    umax = m * G * L / 1.5
     useSwingUp = False
     forcingFunc = swingUpU if useSwingUp else u
-    theta_initial = jnp.pi/3
-    omega_initial = 0
+    theta_initial = 0
+    omega_initial = 1
     t_stop = 10    # seconds to simulate
     dt = 0.01   # time between each sample
     t = jnp.arange(0, t_stop, dt)

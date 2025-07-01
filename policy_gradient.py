@@ -1,3 +1,5 @@
+# Structure of the code inspired by https://github.com/sscivier/equinox-nn-example/blob/main/equinox_nn.ipynb
+
 import math
 import equinox as eqx
 import jax.numpy as jnp
@@ -10,28 +12,28 @@ import optax
 from diffrax import diffeqsolve, ODETerm, SaveAt, Heun
 from tqdm import tqdm
 import jax.tree_util as jtu
-from pendulum_animation import simulateWithDiffraxIntegration
+from pendulum_animation import simulateWithDiffraxIntegration, swingUpU
 import integration
 
 # hyperparameters
-LAYERS = [9, 10, 10, 1] # number of neurons in each fully-connected layer
+LAYERS = [3, 64, 64, 1] # number of neurons in each fully-connected layer
 ACTIVATION_FUNC = jnp.tanh
 BATCH_SIZE = 64
-LEARNING_RATE = 3e-4
+LEARNING_RATE = 3e-3
 STEPS = 300
 PRINT_EVERY = 30
 SEED = 5678
-EPOCHS = 5000
+EPOCHS = 1000
 
 # simulation details
 m = 1.0
-b = 0
+b = 0.1
 L = 1.0
 G = 9.8
 k = 1
-umax = 20
-theta_initial = jnp.pi/3
-omega_initial = 0
+umax = m * G * L / 1.5    # saturated at mgl
+theta_initial = -59 * jnp.pi / 180
+omega_initial = 0.5
 theta_goal = jnp.pi
 omega_goal = 0
 t_stop = 10    # seconds to simulate
@@ -67,23 +69,41 @@ class Policy(eqx.Module):
     def __call__(self, x):
         for layer in self.layers:
             x = layer(x)
+        
+        # subtract bias then normalize then call tanh to avoid having too large of an output
+        # x = x - jnp.mean(x)
+        # x = x / jnp.linalg.norm(x)
+        scaled = 0.5 * x
+        return umax * jnp.tanh(scaled)
         return x
 
 def dynamics_eqn_func(theta, omega, t, m, g, l, b, k, umax, F):
     spring_constant = m * g / l
-    return (F(jnp.array([t, m, g, l, b, k, umax, theta, omega])) - b * omega - spring_constant * jnp.sin(theta)) / m
+    return (F(jnp.array([jnp.sin(theta), jnp.cos(theta), omega])) - b * omega - spring_constant * jnp.sin(theta)) / m
 
-def cost_func(t, theta, omega, currentAction):
-    theta_diff = jnp.array([theta_goal]) - theta
+def cost_func(t, theta, omega, currentAction, learnFromAction=None):
+    # currently set to learn from the swing up policy
+    goal_arr = jnp.array([theta_goal])
+    theta_diff = jnp.mod(theta - goal_arr + jnp.pi, 2 * jnp.pi) - jnp.pi
+    # theta_diff = jnp.array([theta_goal]) - theta
     omega_diff = jnp.array([omega_goal]) - omega
+    action_diff = jnp.array([learnFromAction]) - currentAction
 
-    return jnp.sin(theta_diff)**2 + 0.1 * omega_diff**2 + 0.01 * currentAction**2
+    return  theta_diff**2 + 0.01 * omega_diff**2 + 0.001 * currentAction**2
 
 def terminal_cost_func(theta_final, omega_final, action_final):
     theta_diff = jnp.array([theta_goal]) - theta_final
     omega_diff = jnp.array([omega_goal]) - omega_final
 
-    return 10 * (jnp.sin(theta_diff)**2 + omega_diff**2 + action_final**2)
+    return 10 * (theta_diff**2 + 0.01 * omega_diff**2 + 0.001 * action_final**2)
+
+def teacher_cost_func(unused_t, unused_theta, unused_omega, currentAction, teacherAction):
+    action_diff = jnp.array([teacherAction]) - currentAction
+    return action_diff**2
+
+def teacher_terminal_cost_func(unused_theta, unused_omega, unused_action):
+    # defined this way for duck typing
+    return jnp.array([0])
 
 def augmented_ode(t, y, args):
     theta, omega, J = y
@@ -91,7 +111,8 @@ def augmented_ode(t, y, args):
     dtheta = jnp.array([omega])
     domega = dynamics_eqn_func(theta, omega, t, m, g, l, b, k, umax, F)
     currentAction = domega
-    dJ = cost_func(t, theta, omega, currentAction)
+    swingUpAction = swingUpU(t, m, g, l, b, k, umax, theta, omega)
+    dJ = cost_func(t, theta, omega, currentAction, swingUpAction)
 
     return jnp.squeeze(jnp.array([dtheta, domega, dJ]), -1)
 
@@ -121,7 +142,7 @@ def loss_fn(policy, dynamics_eqn_func, cost_func, terminal_cost_func):
     theta_final = theta[last_elem_index]
     omega_final = omega[last_elem_index]
     J_final = J[last_elem_index]
-    action_final = policy(jnp.array([time_final, m, G, L, b, k, umax, theta_final, omega_final]))
+    action_final = policy(jnp.array([jnp.sin(theta_final), jnp.cos(theta_final), omega_final]))
 
     return jnp.squeeze(J_final) + jnp.squeeze(terminal_cost_func(theta_final, omega_final, action_final))
 
@@ -136,10 +157,10 @@ def train(policy, optim, epochs, print_every):
     loss = 0
 
     @eqx.filter_jit
-    def make_step(policy, opt_state, params):
+    def make_step(policy, cost_function, terminal_cost_function, opt_state, params):
         # loss, grads = eqx.filter_value_and_grad(loss_fn)(params, dynamics_eqn_func, cost_func, terminal_cost_func)
         grad_fn = eqx.filter_value_and_grad(loss_fn, has_aux=False)
-        loss, grads = grad_fn(policy, dynamics_eqn_func, cost_func, terminal_cost_func)
+        loss, grads = grad_fn(policy, dynamics_eqn_func, cost_function, terminal_cost_function)
         updates, opt_state = optim.update(grads, opt_state)
         # new_params = eqx.apply_updates(params, updates)
         # policy = eqx.combine(new_params, policy)
@@ -147,11 +168,18 @@ def train(policy, optim, epochs, print_every):
         return policy, opt_state, params, loss
 
     with tqdm(
-        bar_format="loss: {postfix} | Elapsed: {elapsed} | {rate_fmt}",
-        postfix=loss,
+        bar_format="Warm start w/ teacher | Elapsed: {elapsed} | {rate_fmt}",
     ) as t:
-        for epoch in range(epochs):
-            policy, opt_state, params, loss = make_step(policy, opt_state, params)
+        for epoch in range(int(epochs / 2)):
+            policy, opt_state, params, loss = make_step(policy, teacher_cost_func, teacher_terminal_cost_func, opt_state, params)
+            if (epoch % print_every == 0) or (epoch == epochs - 1):
+                print("Most recent loss: ", loss)
+
+    with tqdm(
+        bar_format="Self-training to stabilize at top | Elapsed: {elapsed} | {rate_fmt}",
+    ) as t:
+        for epoch in range(int(epochs / 2)):
+            policy, opt_state, params, loss = make_step(policy, cost_func, terminal_cost_func, opt_state, params)
             if (epoch % print_every == 0) or (epoch == epochs - 1):
                 print("Most recent loss: ", loss)
     

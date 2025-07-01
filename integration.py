@@ -39,5 +39,5 @@ def pendulum_ode_nn(t, y, args):
     m, g, l, b, k, umax, F = args
     spring_constant = m * g / l
     dtheta = omega
-    domega =  F(jnp.array([t, m, g, l, b, k, umax, theta, omega])) - b * omega - spring_constant * jnp.sin(theta) / m
+    domega =  F(jnp.array([jnp.sin(theta), jnp.cos(theta), omega])) - b * omega - spring_constant * jnp.sin(theta) / m
     return jnp.array([dtheta, jnp.squeeze(domega)])
