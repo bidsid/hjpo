@@ -82,12 +82,9 @@ def dynamics_eqn_func(theta, omega, t, m, g, l, b, k, umax, F):
     return (F(jnp.array([jnp.sin(theta), jnp.cos(theta), omega])) - b * omega - spring_constant * jnp.sin(theta)) / m
 
 def cost_func(t, theta, omega, currentAction, learnFromAction=None):
-    # currently set to learn from the swing up policy
     goal_arr = jnp.array([theta_goal])
     theta_diff = jnp.mod(theta - goal_arr + jnp.pi, 2 * jnp.pi) - jnp.pi
-    # theta_diff = jnp.array([theta_goal]) - theta
     omega_diff = jnp.array([omega_goal]) - omega
-    action_diff = jnp.array([learnFromAction]) - currentAction
 
     return  theta_diff**2 + 0.01 * omega_diff**2 + 0.001 * currentAction**2
 
@@ -110,7 +107,7 @@ def augmented_ode(t, y, args):
     m, g, l, b, k, umax, F, dynamics_eqn_func, cost_func = args
     dtheta = jnp.array([omega])
     domega = dynamics_eqn_func(theta, omega, t, m, g, l, b, k, umax, F)
-    currentAction = domega
+    currentAction = nn_policy_torque_calc(F, t, m, g, l, b, k, umax, theta, omega)
     swingUpAction = swingUpU(t, m, g, l, b, k, umax, theta, omega)
     dJ = cost_func(t, theta, omega, currentAction, swingUpAction)
 
@@ -155,6 +152,8 @@ def train(policy, optim, epochs, print_every):
     # print("params is ", params)
     opt_state = optim.init(params)
     loss = 0
+    teacher_losses = [0] * int(epochs / 2)
+    selftaught_losses = [0] * int(epochs / 2)
 
     @eqx.filter_jit
     def make_step(policy, cost_function, terminal_cost_function, opt_state, params):
@@ -172,6 +171,7 @@ def train(policy, optim, epochs, print_every):
     ) as t:
         for epoch in range(int(epochs / 2)):
             policy, opt_state, params, loss = make_step(policy, teacher_cost_func, teacher_terminal_cost_func, opt_state, params)
+            teacher_losses[epoch] = loss
             if (epoch % print_every == 0) or (epoch == epochs - 1):
                 print("Most recent loss: ", loss)
 
@@ -180,17 +180,24 @@ def train(policy, optim, epochs, print_every):
     ) as t:
         for epoch in range(int(epochs / 2)):
             policy, opt_state, params, loss = make_step(policy, cost_func, terminal_cost_func, opt_state, params)
+            selftaught_losses[epoch] = loss
             if (epoch % print_every == 0) or (epoch == epochs - 1):
                 print("Most recent loss: ", loss)
     
-    return policy
+    return policy, [teacher_losses, selftaught_losses]
 
+def nn_policy_torque_calc(policy, t, m, g, l, b, k, umax, theta, thetadot):
+    # wrapper function for duck typing
+    # Necessary because generic forces are functions of 9 inputs t through thetadot
+    # but the neural policies in this file take only 1 input which is an array of
+    # sintheta, costheta, omega
+    # so this abstracts getting the torque which allows the pendulum animation file
+    # to have no information on what kind of policy it's getting
+    return jnp.squeeze(policy(jnp.array([jnp.sin(theta), jnp.cos(theta), thetadot])), -1)
 
 if __name__ == "__main__":
     model = Policy(layer_sizes=LAYERS, activation_func=ACTIVATION_FUNC, key=key)
-    print(model)
-    print(jtu.tree_structure(model))
     optim = optax.adam(LEARNING_RATE)
-    finished_model = train(model, optim, EPOCHS, PRINT_EVERY)
-    simulateWithDiffraxIntegration(integration.pendulum_ode_nn, t_stop, dt, theta_initial, omega_initial, m, b, L, G, k, umax, finished_model)
+    finished_model, losses = train(model, optim, EPOCHS, PRINT_EVERY)
+    simulateWithDiffraxIntegration(integration.pendulum_ode_nn, nn_policy_torque_calc, t_stop, dt, theta_initial, omega_initial, m, b, L, G, k, umax, finished_model, losses)
 
