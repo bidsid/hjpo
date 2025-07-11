@@ -48,7 +48,7 @@ def simulateWithDiffraxIntegration(ode, torque_calc, t_stop, dt, theta_initial, 
     omega = sol.ys[:,1]
     times = sol.ts
     energies = 0.5 * m * (L * omega)**2 + m * G * L * (1 - jnp.cos(theta))
-    torques = jnp.array([torque_calc(policy, times[i], m, G, L, b, k, umax, theta[i], omega[i]) for i in range(len(times))])
+    torques = jnp.array([torque_calc(policy, times[i], m, G, L, b, k, umax, theta=theta[i], omega=omega[i]) for i in range(len(times))])
 
     x = L * jnp.sin(theta)
     y = -L * jnp.cos(theta)
