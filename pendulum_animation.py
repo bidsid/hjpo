@@ -45,13 +45,14 @@ def simulateWithDiffraxIntegration(ode, torque_calc, t_stop, dt, theta_initial, 
         args=(m, G, L, b, k, umax, policy),
     )
     theta = sol.ys[:,0]
+    theta = (theta + jnp.pi) % (2 * jnp.pi) - jnp.pi
     omega = sol.ys[:,1]
     times = sol.ts
-    energies = 0.5 * m * (L * omega)**2 + m * G * L * (1 - jnp.cos(theta))
+    energies = 0.5 * m * (L * omega)**2 + m * G * L * (1 - jnp.cos(theta - jnp.pi))
     torques = jnp.array([torque_calc(policy, times[i], m, G, L, b, k, umax, theta=theta[i], omega=omega[i]) for i in range(len(times))])
 
-    x = L * jnp.sin(theta)
-    y = -L * jnp.cos(theta)
+    x = L * jnp.sin(theta - jnp.pi)
+    y = -L * jnp.cos(theta - jnp.pi)
 
     # fig, axs = plt.figure(figsize=(5, 4))
     fig, axs = plt.subplots(2, 2)
@@ -85,11 +86,12 @@ def simulateWithDiffraxIntegration(ode, torque_calc, t_stop, dt, theta_initial, 
     axs[1, 0].legend()
     axs[1, 1].set_title("Loss vs iteration")
     if loss != None:
-        axs[1, 1].plot(loss[0], color="gray", label="Teacher")
-        axs[1, 1].plot(jnp.arange(len(loss[0]), len(loss[0]) + len(loss[1]), 1), loss[1], label="Own loss")
+        axs[1, 1].set_yscale('log')
+        axs[1, 1].plot(loss, color="gray", label="loss")
+        # axs[1, 1].plot(jnp.arange(len(loss[0]), len(loss[0]) + len(loss[1]), 1), loss[1], label="Own loss")
         axs[1, 1].legend()
         axs[1, 1].set_xlabel("Epoch number")
-        axs[1, 1].set_ylabel("Loss amount")
+        axs[1, 1].set_ylabel("Average Loss amount per epoch")
     
     def animate(i, thetas, omegas, times, energies, torques, x, y):
         theta = thetas[i]
