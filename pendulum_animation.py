@@ -2,6 +2,8 @@
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import matplotlib
+import imageio_ffmpeg
 import jax.numpy as jnp
 from integration import derivative_function, eulers_method, pendulum_ode
 from diffrax import diffeqsolve, ODETerm, SaveAt, Heun
@@ -28,89 +30,166 @@ def generic_torque_calculator_fn(F, t, m, g, l, b, k, umax, theta, thetadot):
     # F is a forcing function that outputs a torque
     return F(t, m, g, l, b, k, umax, theta, thetadot)
 
+# Plot handler
+class FigureSwitcher:
+    def __init__(self, ax, data):
+        self.ax = ax
+        self.data = data
+        self.index = 0
+        self.plot_current()
+
+    def plot_current(self):
+        self.ax.clear()
+        x, y, title = self.data[self.index]
+        self.ax.plot(x, y)
+        self.ax.set_title(title)
+        self.ax.figure.canvas.draw()
+
+    def next(self, event):
+        self.index = (self.index + 1) % len(self.data)
+        self.plot_current()
+
+    def prev(self, event):
+        self.index = (self.index - 1) % len(self.data)
+        self.plot_current()
+
 def simulateWithDiffraxIntegration(ode, torque_calc, t_stop, dt, theta_initial, omega_initial, m, b, L, G, k, 
-                                   umax, policy, loss=None):
+                                   umax, policy, run_name):
     t = jnp.arange(0, t_stop, dt)
+
+    numPlots = len(theta_initial)
+    print("Generating ", str(numPlots), " plots.")
+    isSquare = int(numPlots**(0.5))**2 == numPlots
+    if not isSquare:
+        print("Requires square number of plots.")
+        return
+    dim = int(numPlots**0.5)
+    
+    thetaLists = [None] * numPlots
+    omegaLists = [None] * numPlots
+    energyLists = [None] * numPlots
+    torqueLists = [None] * numPlots
+    times = [None]
+    xs = [None] * numPlots
+    ys = [None] * numPlots
+    lines = [None] * numPlots
+    traces = [None] * numPlots
 
     term = ODETerm(ode)
     solver = Heun()
-    sol = diffeqsolve(
-        term,
-        solver,
-        t0=0,
-        t1=t_stop,
-        dt0=dt,
-        y0=jnp.array([theta_initial, omega_initial]),
-        saveat=SaveAt(ts=t),
-        args=(m, G, L, b, k, umax, policy),
-    )
-    theta = sol.ys[:,0]
-    theta = (theta + jnp.pi) % (2 * jnp.pi) - jnp.pi
-    omega = sol.ys[:,1]
-    times = sol.ts
-    energies = 0.5 * m * (L * omega)**2 + m * G * L * (1 - jnp.cos(theta - jnp.pi))
-    torques = jnp.array([torque_calc(policy, times[i], m, G, L, b, k, umax, theta=theta[i], omega=omega[i]) for i in range(len(times))])
 
-    x = L * jnp.sin(theta - jnp.pi)
-    y = -L * jnp.cos(theta - jnp.pi)
+    animationFig, axs = plt.subplots(dim, dim)
+    animationFig.suptitle("Pendulum simulation animations")
+    plt.subplots_adjust(bottom=0.25)
+    time_ax = plt.axes([0.2, 0.1, 0.6, 0.03])
+    time_ax.text(0, 0, "time is ")
 
-    # fig, axs = plt.figure(figsize=(5, 4))
-    fig, axs = plt.subplots(2, 2)
-    fig.suptitle(f"Pendulum data (starting angle {theta_initial} rads, starting angular vel. {omega_initial} rad/s, umax {umax} Nm)")
-    ax = axs[0, 0]
-    ax.set_title("Simulation")
-    ax.set_ylim(-L, 1.)
-    ax.set_xlim(-L, L)
-    # ax = fig.add_subplot(autoscale_on=False, xlim=(-L, L), ylim=(-L, 1.))
-    ax.set_aspect('equal')
-    ax.grid()
+    for i in range(numPlots):
+        sol = diffeqsolve(
+            term,
+            solver,
+            t0=0,
+            t1=t_stop,
+            dt0=dt,
+            y0=jnp.array([theta_initial[i], omega_initial[i]]),
+            saveat=SaveAt(ts=t),
+            args=(m, G, L, b, k, umax, policy),
+        )
+        thetaLists[i] = sol.ys[:,0]
+        # theta = (theta + jnp.pi) % (2 * jnp.pi) - jnp.pi
+        omegaLists[i] = sol.ys[:,1]
+        times = sol.ts
+        energy_theta = (thetaLists[i] + jnp.pi) % (2 * jnp.pi) - jnp.pi
+        energyLists[i] = 0.5 * m * (L * omegaLists[i])**2 + m * G * L * (1 + jnp.cos(energy_theta))
+        # energies = 0.5 * m * (L * omega)**2 + m * G * L * (1 - jnp.cos(theta - jnp.pi))
+        torques = jnp.array([torque_calc(policy, times[i], m, G, L, b, k, umax, theta=thetaLists[i][j], omega=omegaLists[i][j]) for j in range(len(times))])
 
-    line, = ax.plot([], [], 'o-', lw=2)
-    trace, = ax.plot([], [], '.-', lw=1, ms=2)
-    time_template = 'time = %.1fs, energy = %.1fJ, torque = %.1fNm'
-    time_text = ax.text(0.05, 0.9, '', transform=ax.transAxes)
-    energy_template = 'Energy = %.1fJ'
-    torque_template = '\nTorque = %.1fNm'
+        xs[i] = -L * jnp.sin(thetaLists[i])
+        ys[i] = L * jnp.cos(thetaLists[i])
 
-    axs[0, 1].set_title("Phase diagram")
-    axs[0, 1].plot(theta, omega)
-    axs[0, 1].set_xlabel("Angle (radians)")
-    axs[0, 1].set_ylabel("Angular velocity (rad/s)")
-    axs[1, 0].set_title("Time series")
-    axs[1, 0].set_xlabel("Time (s)")
-    axs[1, 0].set_ylabel("Value (Radians for angular and Nm for Torque/Energy)")
-    axs[1, 0].plot(times, theta, color="orange", label="Theta")
-    axs[1, 0].plot(times, omega, color="red", label="Omega")
-    axs[1, 0].plot(times, energies, color="green", label="Energy")
-    axs[1, 0].plot(times, torques, color="blue", label="Torque")
-    axs[1, 0].legend()
-    axs[1, 1].set_title("Loss vs iteration")
-    if loss != None:
-        axs[1, 1].set_yscale('log')
-        axs[1, 1].plot(loss, color="gray", label="loss")
-        # axs[1, 1].plot(jnp.arange(len(loss[0]), len(loss[0]) + len(loss[1]), 1), loss[1], label="Own loss")
-        axs[1, 1].legend()
-        axs[1, 1].set_xlabel("Epoch number")
-        axs[1, 1].set_ylabel("Average Loss amount per epoch")
+        ax = axs if numPlots == 1 else axs[i // dim, i % dim]
+        ax.set_ylim(-L, 1.)
+        ax.set_xlim(-L, L)
+        ax.set_aspect('equal')
+        ax.grid()
+        lines[i], = ax.plot([], [], 'o-', lw=2)
+        traces[i], = ax.plot([], [], '.-', lw=1, ms=2)
+
+        print(f"Generated plot {i + 1} / {numPlots}")
     
-    def animate(i, thetas, omegas, times, energies, torques, x, y):
-        theta = thetas[i]
-        thetadot = omegas[i]
-        thisx = [0, x[i]]
-        thisy = [0, y[i]]
-        thist = times[i]
-        thisenergy = energies[i]
-        thistorque = torques[i]
+    def update(frame):
+        artists = []
+        for i in range(numPlots):
+            lines[i].set_data([0, xs[i][frame]], [0, ys[i][frame]])
+            artists.append(lines[i])
+            artists.append(traces[i])
+        return artists
+    
+    ani = animation.FuncAnimation(animationFig, update, len(times), interval=t_stop, blit=True)
+    matplotlib.rcParams["animation.ffmpeg_path"] = imageio_ffmpeg.get_ffmpeg_exe()
+    Writer = animation.writers['ffmpeg']
+    writer = Writer(fps=15, metadata=dict(artist='Me'), bitrate=1800)
+    filename = f"E:\\usc sure\\hjpo\\{run_name}.mp4"
+    ani.save(filename=filename, writer=writer)
 
-        line.set_data(thisx, thisy)
-        # energy = 0.5 * m * (L * thetadot)**2 + m * G * L * (1 - jnp.cos(theta))
-        # torque = torque_calc(policy, thist, m, G, L, b, k, umax, theta, thetadot)
-        time_text.set_text(time_template % (i*dt, thisenergy, thistorque))
 
-        return line, trace, time_text
 
-    ani = animation.FuncAnimation(
-        fig, animate, len(theta), fargs=(theta, omega, times, energies, torques, x, y, ), interval=t_stop, blit=True)
+
+    # fig.suptitle(f"Pendulum data (starting angle {theta_initial} rads, starting angular vel. {omega_initial} rad/s, umax {umax} Nm)")
+    # ax = axs[0, 0]
+    # ax.set_title("Simulation")
+    # ax.set_ylim(-L, 1.)
+    # ax.set_xlim(-L, L)
+    # # ax = fig.add_subplot(autoscale_on=False, xlim=(-L, L), ylim=(-L, 1.))
+    # ax.set_aspect('equal')
+    # ax.grid()
+
+    # line, = ax.plot([], [], 'o-', lw=2)
+    # trace, = ax.plot([], [], '.-', lw=1, ms=2)
+    # time_template = 'time = %.1fs, energy = %.1fJ, torque = %.1fNm'
+    # time_text = ax.text(0.05, 0.9, '', transform=ax.transAxes)
+    # energy_template = 'Energy = %.1fJ'
+    # torque_template = '\nTorque = %.1fNm'
+
+    # axs[0, 1].set_title("Phase diagram")
+    # axs[0, 1].plot(theta, omega)
+    # axs[0, 1].set_xlabel("Angle (radians)")
+    # axs[0, 1].set_ylabel("Angular velocity (rad/s)")
+    # axs[1, 0].set_title("Time series")
+    # axs[1, 0].set_xlabel("Time (s)")
+    # axs[1, 0].set_ylabel("Value (Radians for angular and Nm for Torque/Energy)")
+    # axs[1, 0].plot(times, theta, color="orange", label="Theta")
+    # axs[1, 0].plot(times, omega, color="red", label="Omega")
+    # axs[1, 0].plot(times, energies, color="green", label="Energy")
+    # axs[1, 0].plot(times, torques, color="blue", label="Torque")
+    # axs[1, 0].legend()
+    # axs[1, 1].set_title("Loss vs iteration")
+    # if loss != None:
+    #     axs[1, 1].set_yscale('log')
+    #     axs[1, 1].plot(loss, color="gray", label="loss")
+    #     # axs[1, 1].plot(jnp.arange(len(loss[0]), len(loss[0]) + len(loss[1]), 1), loss[1], label="Own loss")
+    #     axs[1, 1].legend()
+    #     axs[1, 1].set_xlabel("Epoch number")
+    #     axs[1, 1].set_ylabel("Average Loss amount per epoch")
+    
+    # def animate(i, thetas, omegas, times, energies, torques, x, y):
+    #     theta = thetas[i]
+    #     thetadot = omegas[i]
+    #     thisx = [0, x[i]]
+    #     thisy = [0, y[i]]
+    #     thist = times[i]
+    #     thisenergy = energies[i]
+    #     thistorque = torques[i]
+
+    #     line.set_data(thisx, thisy)
+    #     # energy = 0.5 * m * (L * thetadot)**2 + m * G * L * (1 - jnp.cos(theta))
+    #     # torque = torque_calc(policy, thist, m, G, L, b, k, umax, theta, thetadot)
+    #     time_text.set_text(time_template % (i*dt, thisenergy, thistorque))
+
+    #     return line, trace, time_text
+
+    # ani = animation.FuncAnimation(
+    #     fig, animate, len(theta), fargs=(theta, omega, times, energies, torques, x, y, ), interval=t_stop, blit=True)
 
     plt.show()
 

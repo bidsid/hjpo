@@ -26,7 +26,7 @@ LEARNING_RATE = 3e-3
 STEPS = 300
 PRINT_EVERY = 5
 SEED = 5678
-EPOCHS = 50
+EPOCHS = 0
 THETA_COST_COEFF = 1
 THETADOT_COST_COEFF = 0.5
 ACTION_COST_COEFF_TRAINING = 0.01   # R in the writeup
@@ -47,7 +47,7 @@ omega_initial = 0
 theta_goal = 0
 omega_goal = 0
 t_stop = 10    # seconds to simulate
-dt = 0.01   # time between each sample
+dt = 0.05   # time between each sample
 t = jnp.arange(0, t_stop, dt)
 
 # batch training
@@ -55,15 +55,53 @@ GRID_THETA_BOUND = jnp.pi
 GRID_OMEGA_BOUND = m * G * L
 EPSILON = 0
 DELTA = 0
-initial_thetas = [i * jnp.pi/BATCH_SIZE for i in range(BATCH_SIZE)]
-initial_conditions = jnp.stack(jnp.array([initial_thetas, jnp.zeros(BATCH_SIZE)]), -1)
+NUM_ICS = 4
+initial_thetas = [i * jnp.pi/NUM_ICS for i in range(NUM_ICS)]
+initial_omegas = [0] * NUM_ICS
+initial_conditions = jnp.stack(jnp.array([initial_thetas, jnp.zeros(NUM_ICS)]), -1)
 
 config = {
     "hyperparameters": {
         "layers": LAYERS,
         "activation_function": ACTIVATION_FUNC,
-
+        "batch_size": BATCH_SIZE,
+        "batches_per_epoch": NUM_BATCHES,
+        "epochs": EPOCHS,
+        "learning_rate": LEARNING_RATE,
     },
+
+    "sampling": {
+        "num_grid_theta_points": NUM_GRID_THETA_POINTS,
+        "num_grid_omega_points": NUM_GRID_OMEGA_POINTS,
+        "grid_theta_bound": GRID_THETA_BOUND,
+        "grid_omega_bound": GRID_OMEGA_BOUND,
+        "prng_seed": SEED,
+    },
+
+    "loss": {
+        "theta_cost_coefficient": THETA_COST_COEFF,
+        "omega_cost_coefficient": THETADOT_COST_COEFF,
+        "action_cost_coefficient": ACTION_COST_COEFF_TRAINING,
+    },
+
+    "simulation": {
+        "mass": m,
+        "damping_coefficient": b,
+        "length_of_pendulum": L,
+        "gravitational_coefficient": G,
+        "energy_swing_coefficient": k,
+        "max_torque": umax,
+        "theta_initial": theta_initial,
+        "theta_goal": theta_goal,
+        "omega_initial": omega_initial,
+        "omega_goal": omega_goal,
+        "simulation_duration": t_stop,
+        "simulation_timestep": dt,
+    },
+
+    "methods": {
+        "projection": "hard clipping",
+    }
 }
 
 
@@ -254,7 +292,7 @@ def curriculum_progress(step):
     return 1
     return jnp.clip(6 * step / (EPOCHS * NUM_BATCHES), 0, 1)
 
-def train(params, optim, key):
+def train(params, optim, key, run=None):
     opt_state = optim.init(params)
     losses = [0] * EPOCHS
     NUM_RANDOM_DIM = 10
@@ -285,6 +323,8 @@ def train(params, optim, key):
             new_key, subkey = jax.random.split(new_key)
             random_sampled_states = sample_online(subkey)
             opt_state, params, loss = make_step(opt_state, params, random_sampled_states, epoch * NUM_BATCHES + batch)
+            if not run == None:
+                run.log({"loss": loss})
             epoch_loss += loss
 
             if (batch % PRINT_EVERY == 0) or (batch == NUM_BATCHES - 1):
@@ -320,7 +360,18 @@ if __name__ == "__main__":
     optim = optax.adam(LEARNING_RATE)
     new_key3, subkey3 = jax.random.split(new_key2)
     del new_key2
-    params, losses = train(params, optim, subkey3)
+    wandb.login()
+    run_name = "FFMPEG saving 2, to wandb"
+    run = None
+    run = wandb.init(
+        entity="k5wang-main-university-of-southern-california",
+        project="sid-version",
+        name=run_name,
+        config=config,
+        notes="From VSCode",
+        tags=["test"]
+    )
+    params, losses = train(params, optim, subkey3, run)
     print("V at (0, 0): {}", pinn.apply(params, jnp.array([0, 1, 0])))
 
     def policyFromValueFunc(theta, omega):
@@ -361,8 +412,14 @@ if __name__ == "__main__":
     contour4 = axs[1, 1].contourf(xv, yv, hjbLoss_grid, levels=50, cmap="coolwarm")
     axs[1, 1].contour(xv, yv, hjbLoss_grid, levels=[-1, 0], colors="black", linewidths=2)
     axs[1, 1].set_title("HJB residual on variety of states")
-    plt.colorbar(contour4, ax=axs[1, 1]) 
+    plt.colorbar(contour4, ax=axs[1, 1])
+    if run != None:
+        wandb.log({"value, action, residual grids": wandb.Image(fig)})
+        wandb.finish()
     
     simulateWithDiffraxIntegration(simulation_ode, valuePolicyTorqueCalc, t_stop, dt, 
-                                   theta_initial, omega_initial, m, b, L, G, k, umax, policyFromValueFunc, 
-                                   loss=losses)
+                                initial_thetas, initial_omegas, m, b, L, G, k, umax, policyFromValueFunc, 
+                                run_name=run_name)
+    
+    if run != None:
+        run.log({"simulations": wandb.Video(f"E:\\usc sure\\hjpo\\{run_name}.mp4", fps=4, format="mp4")})
