@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import wandb
 
 # hyperparameters
-LAYERS = [3, 128, 128, 2] # number of neurons in each fully-connected layer
+LAYERS = [9, 128, 128, 2] # number of neurons in each fully-connected layer
 ACTIVATION_FUNC = jnp.tanh
 NUM_GRID_THETA_POINTS = 100
 NUM_GRID_OMEGA_POINTS = 300
@@ -26,11 +26,13 @@ LEARNING_RATE = 3e-3
 STEPS = 300
 PRINT_EVERY = 5
 SEED = 5678
-EPOCHS = 0
+EPOCHS = 50
 THETA_COST_COEFF = 1
 THETADOT_COST_COEFF = 0.5
 ACTION_COST_COEFF_TRAINING = 0.01   # R in the writeup
 ACTION_COST_COEFF_PDE = ACTION_COST_COEFF_TRAINING
+V0_COST_COEFF = 500
+SLACK_WEIGHT = 1e-1
 RANDOM_THETA_AMP = 0
 RANDOM_OMEGA_AMP = jnp.pi
 
@@ -40,7 +42,7 @@ b = 0.0
 L = 1.0
 G = 9.8
 k = 1
-umax = m * G * L / 2   # saturated at mgl
+umax = m * G * L /2    # saturated at mgl
 NO_LIMIT = m * G * L * 10
 theta_initial = jnp.pi
 omega_initial = 0
@@ -55,8 +57,8 @@ GRID_THETA_BOUND = jnp.pi
 GRID_OMEGA_BOUND = m * G * L
 EPSILON = 0
 DELTA = 0
-NUM_ICS = 4
-initial_thetas = [i * jnp.pi/NUM_ICS for i in range(NUM_ICS)]
+NUM_ICS = 9
+initial_thetas = [2 * i * jnp.pi/NUM_ICS for i in range(NUM_ICS)]
 initial_omegas = [0] * NUM_ICS
 initial_conditions = jnp.stack(jnp.array([initial_thetas, jnp.zeros(NUM_ICS)]), -1)
 
@@ -82,6 +84,7 @@ config = {
         "theta_cost_coefficient": THETA_COST_COEFF,
         "omega_cost_coefficient": THETADOT_COST_COEFF,
         "action_cost_coefficient": ACTION_COST_COEFF_TRAINING,
+        "v0_cost_coefficient": V0_COST_COEFF,
     },
 
     "simulation": {
@@ -99,8 +102,9 @@ config = {
         "simulation_timestep": dt,
     },
 
-    "methods": {
-        "projection": "hard clipping",
+    "other": {
+        "projection": "tanh",
+        "slack_weight": SLACK_WEIGHT,
     }
 }
 
@@ -140,20 +144,45 @@ class PINNS(nn.Module):
                 x = self.layers[i](x)
                 x = ACTIVATION_FUNC(x)
             x = self.layers[len(self.layers) - 1](x)   # applying the final layer
-            SLACK_WEIGHT = 1e-1
             mat = jnp.outer(x, x) + SLACK_WEIGHT * jnp.eye(2)  # slack weight times I2
             return x.T @ mat @ x + jnp.inner(x, x)
         
         return inner_call(x)
+    
+    @staticmethod
+    def feature_fn(theta, omega):
+        # Core features
+        sin_theta = jnp.sin(theta)
+        cos_theta = jnp.cos(theta)
+        
+        # Useful extras
+        theta_unwrapped = jnp.arctan2(sin_theta, cos_theta)
+        omega_squared = omega ** 2
+        sin2 = jnp.sin(2 * theta)
+        cos2 = jnp.cos(2 * theta)
+        phase_term = theta * omega
+        bounded_omega = omega / (1 + jnp.abs(omega))
+        
+        return jnp.array([
+            sin_theta,
+            cos_theta,
+            omega,
+            omega_squared,
+            sin2,
+            cos2,
+            phase_term,
+            bounded_omega,
+            theta_unwrapped
+        ])
 
 
 def stage_cost_func(theta, omega, action, stepNum):
     theta_diff = theta_goal - theta # jnp.mod(theta - theta_goal + jnp.pi, 2 * jnp.pi) - jnp.pi  # look into
     omega_diff = omega_goal - omega
     theta_part = THETA_COST_COEFF * jnp.sin(theta_diff)**2 + THETA_COST_COEFF * (jnp.cos(theta_diff) - 1)**2
-    energy = 0.5 * m * (L * omega)**2 + m * G * L * (1 - jnp.cos(theta))
-    energy_diff = 2 * m * G * L - energy
-    energy_part = (1 - curriculum_progress(stepNum)) * energy_diff**2
+    # energy = 0.5 * m * (L * omega)**2 + m * G * L * (1 - jnp.cos(theta))
+    # energy_diff = 2 * m * G * L - energy
+    # energy_part = (1 - curriculum_progress(stepNum)) * energy_diff**2
     return theta_part + THETADOT_COST_COEFF * omega_diff**2 + ACTION_COST_COEFF_TRAINING * action**2
 
 # Not currently in use
@@ -185,37 +214,41 @@ def pinns_loss_hamiltonian(pinn, params, theta, omega, u_func, stepNum):
     g_part = g_inner_product#  * (1 / ACTION_COST_COEFF_PDE) * g_inner_product
     hamiltonian = f_part + g_part + stage_cost_func(theta, omega, u_func(theta, omega), stepNum)
     # hamiltonian = jnp.inner(grad_V_wrt_unembedded_state, affine_dynamics_f_func(theta, omega)) - 0.5 * (1 / action)
-    v0_loss = 500 * (pinn.apply(params, jnp.array([jnp.sin(0), jnp.cos(0), 0])) - 0)**2
+    v0_loss = V0_COST_COEFF * (pinn.apply(params, PINNS.feature_fn(0, 0)) - 0)**2
     return hamiltonian**2 + v0_loss
 
 # Used to enforce the torque limit
 def project(u, stepNum):
     # return 0.5 * (umin + umax) * jnp.tanh(0.5 * u)    # did not work
-    # return 0.5 * (umax - umin) * (jnp.tanh(u) + 1) + umin # almost worked
-    p = curriculum_progress(stepNum)
-    appliedBound = NO_LIMIT * (1 - p) + umax * p
-    return jnp.clip(u, -umax, umax)    # almost worked
+    return umax * (jnp.tanh(u) + 1) - umax # almost worked
+    # return u
+    # p = curriculum_progress(stepNum)
+    # appliedBound = NO_LIMIT * (1 - p) + umax * p
+    # return jnp.clip(u, -umax, umax)    # almost worked
     # tanh_part = 0.5 * (umax - umin) * (jnp.tanh(u) + 1) + umin
     # clip_part = jnp.clip(u, umin, umax)
     # return 0.5 * (tanh_part + clip_part)  # combining didn't work, they fought each other
-    # def soft_saturate(x, limit):
-    #     return limit * x / (1 + jnp.abs(x))
-    # return soft_saturate(u, umax) # did not work
-
-# outputs 3 element array since the value function takes in 3 inputs
-def grad_wrt_inputs(pinn, params, theta, omega):
-    valueFunc = lambda sintheta, costheta, omega: pinn.apply(params, jnp.array([sintheta, costheta, omega]))
-    return jax.grad(valueFunc, argnums=(0, 1, 2))(jnp.sin(theta), jnp.cos(theta), omega)
+    def soft_saturate(x, limit):
+        return limit * x / (1 + jnp.abs(x))
+    # return umax * jnp.tanh(soft_saturate(u, umax)) # did not work
+    return umax * jnp.tanh(soft_saturate(u, umax))
 
 # outputs 2 element array [dV/dtheta, dV/domega]
 # equivalent to the costate in Kaiyuan's code
 def unembedded_grad_wrt_inputs(pinn, params, theta, omega):
-    valueFunc = lambda sintheta, costheta, omega: pinn.apply(params, jnp.array([sintheta, costheta, omega]))
-    grad_wrt_inputs_fn = jax.grad(valueFunc, argnums=(0, 1, 2))
-    embed_eval = grad_wrt_inputs_fn(jnp.sin(theta), jnp.cos(theta), omega)
-    dgrad_dtheta = embed_eval[0] * jnp.cos(theta) - embed_eval[1] * jnp.sin(theta)
-    unembed_eval = jnp.array([dgrad_dtheta, embed_eval[2]])
-    return unembed_eval
+    valueFunc = lambda theta, omega: pinn.apply(params, PINNS.feature_fn(theta, omega))
+    gradV =  jax.grad(valueFunc, argnums=(0, 1))(theta, omega)
+    return jnp.array([gradV[0], gradV[1]])
+    # autodiff does chain rule by itself so no need to do manual unembedding
+    # 0, 1 argnums to make sure it computes partials for both theta and omega
+
+    # valueFunc = lambda sintheta, costheta, omega: pinn.apply(params, jnp.array([sintheta, costheta, omega]))
+    # gradV = jax.grad(valueFunc, argnums=(0, 1, 2))
+    # ff = PINNS.feature_fn(theta, omega)
+    # embed_eval = gradV(ff[0], ff[1], ff[2])
+    # dgrad_dtheta = embed_eval[0] * jnp.cos(theta) - embed_eval[1] * jnp.sin(theta)
+    # unembed_eval = jnp.array([dgrad_dtheta, embed_eval[2]])
+    # return unembed_eval
 
 # Gives the policy as a function of the value function
 def argmin_hamiltonian_analytic(pinn, params, dynamics_func_g, theta, omega, stepNum):
@@ -264,6 +297,8 @@ def total_loss(params, input_states, stepNum):
     actionFromValue = lambda t, o: argmin_hamiltonian_analytic(pinn, params, affine_dynamics_g_func, t, o, stepNum)
 
     original_hamiltonian_loss = jnp.mean(jax.vmap(lambda input_state: pinns_loss_hamiltonian(pinn, params, input_state[0], input_state[1], actionFromValue, stepNum))(input_states))
+    # bfv = jax.nn.relu
+    # bound_violation_loss = jnp.mean(jax.vmap(lambda input_state: bfv(actionFromValue(input_state[0], input_state[1]) - umax) + bfv(-umax - actionFromValue(input_state[0], input_state[1])))(input_states))
     return  original_hamiltonian_loss
 
 # Not used
@@ -350,18 +385,19 @@ if __name__ == "__main__":
 
     V_fn = lambda state: pinn.apply(params, state)
     grad_fn = jax.grad(V_fn)
-    value_val = pinn.apply(params, jnp.array([0, -1, -m * G * L]))
-    jax.debug.print('V at (-π, -mgl) = {})', value_val)
-    grad_val = grad_fn(jnp.array([0, -1, -m * G * L]))
-    jax.debug.print("∇V wrt input at (-π, -mgl) = {}", grad_val)
+    value_val = pinn.apply(params, PINNS.feature_fn(0, 0))
+    jax.debug.print('V before training at (0, 0) = {})', value_val)
+    grad_val = grad_fn(PINNS.feature_fn(0, 0))
+    jax.debug.print("∇V wrt input before training at (0, 0) = {}", grad_val)
     jax.debug.print("isfinite? {}", jnp.all(jnp.isfinite(grad_val)))
-    
+
+
     
     optim = optax.adam(LEARNING_RATE)
     new_key3, subkey3 = jax.random.split(new_key2)
     del new_key2
     wandb.login()
-    run_name = "FFMPEG saving 2, to wandb"
+    run_name = "New features framework tanh projection saturated"
     run = None
     run = wandb.init(
         entity="k5wang-main-university-of-southern-california",
@@ -369,10 +405,10 @@ if __name__ == "__main__":
         name=run_name,
         config=config,
         notes="From VSCode",
-        tags=["test"]
+        tags=["test", "tanh", "soft-saturate"]
     )
     params, losses = train(params, optim, subkey3, run)
-    print("V at (0, 0): {}", pinn.apply(params, jnp.array([0, 1, 0])))
+    print("V at (0, 0): {}", pinn.apply(params, PINNS.feature_fn(0, 0)))
 
     def policyFromValueFunc(theta, omega):
         return argmin_hamiltonian_analytic(pinn, params, affine_dynamics_g_func, theta, omega, EPOCHS * NUM_BATCHES)
@@ -400,7 +436,7 @@ if __name__ == "__main__":
     axs[0, 1].set_title("Control Action From Swing Up Policy")
 
     plt.colorbar(contour2, ax=axs[0, 1])
-    valueNetVals = jax.vmap(lambda x: pinn.apply(params, jnp.array([jnp.sin(x[0]), jnp.cos(x[0]), x[1]])))(grid_states)
+    valueNetVals = jax.vmap(lambda x: pinn.apply(params, PINNS.feature_fn(x[0], x[1])))(grid_states)
     vn_grid = valueNetVals.reshape(xv.shape)
     contour3 = axs[1, 0].contourf(xv, yv, vn_grid, levels=50, cmap="coolwarm")
     axs[1, 0].set_title("Value network outputs on variety of states")
@@ -413,9 +449,6 @@ if __name__ == "__main__":
     axs[1, 1].contour(xv, yv, hjbLoss_grid, levels=[-1, 0], colors="black", linewidths=2)
     axs[1, 1].set_title("HJB residual on variety of states")
     plt.colorbar(contour4, ax=axs[1, 1])
-    if run != None:
-        wandb.log({"value, action, residual grids": wandb.Image(fig)})
-        wandb.finish()
     
     simulateWithDiffraxIntegration(simulation_ode, valuePolicyTorqueCalc, t_stop, dt, 
                                 initial_thetas, initial_omegas, m, b, L, G, k, umax, policyFromValueFunc, 
@@ -423,3 +456,7 @@ if __name__ == "__main__":
     
     if run != None:
         run.log({"simulations": wandb.Video(f"E:\\usc sure\\hjpo\\{run_name}.mp4", fps=4, format="mp4")})
+
+    if run != None:
+        wandb.log({"value, action, residual grids": wandb.Image(fig)})
+        wandb.finish()
