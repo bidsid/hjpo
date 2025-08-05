@@ -13,9 +13,15 @@ import integration
 import jax.tree_util as jtu
 import matplotlib.pyplot as plt
 import wandb
+import threading
+from matplotlib.colors import LogNorm
+
+jax.config.update("jax_enable_x64", True)
+x = jax.random.uniform(jax.random.key(0), (1,), dtype=jnp.float64)
 
 # hyperparameters
-LAYERS = [9, 128, 128, 2] # number of neurons in each fully-connected layer
+LAYERS = [7, 128, 128, 2] # number of neurons in each fully-connected layer
+SKIP_CONNECTS_ENABLED = False
 ACTIVATION_FUNC = jnp.tanh
 NUM_GRID_THETA_POINTS = 100
 NUM_GRID_OMEGA_POINTS = 300
@@ -23,6 +29,8 @@ NUM_GRID_POINTS = NUM_GRID_THETA_POINTS * NUM_GRID_OMEGA_POINTS
 NUM_BATCHES = 10    # per epoch
 BATCH_SIZE = 3000# int(NUM_GRID_POINTS / NUM_BATCHES)
 LEARNING_RATE = 3e-3
+UPDATE_RESIDS_EVERY = 5
+P_UNIFORM_SAMPLING = 0.2
 STEPS = 300
 PRINT_EVERY = 5
 SEED = 5678
@@ -31,10 +39,11 @@ THETA_COST_COEFF = 1
 THETADOT_COST_COEFF = 0.5
 ACTION_COST_COEFF_TRAINING = 0.01   # R in the writeup
 ACTION_COST_COEFF_PDE = ACTION_COST_COEFF_TRAINING
-V0_COST_COEFF = 500
+V0_COST_COEFF = 1000
 SLACK_WEIGHT = 1e-1
 RANDOM_THETA_AMP = 0
 RANDOM_OMEGA_AMP = jnp.pi
+huber_delta = 0.5
 
 # simulation details
 m = 1.0
@@ -42,7 +51,7 @@ b = 0.0
 L = 1.0
 G = 9.8
 k = 1
-umax = m * G * L /2    # saturated at mgl
+umax = m * G * L / 2    # saturated at mgl
 NO_LIMIT = m * G * L * 10
 theta_initial = jnp.pi
 omega_initial = 0
@@ -54,7 +63,7 @@ t = jnp.arange(0, t_stop, dt)
 
 # batch training
 GRID_THETA_BOUND = jnp.pi
-GRID_OMEGA_BOUND = m * G * L
+GRID_OMEGA_BOUND = 2 * m * G * L
 EPSILON = 0
 DELTA = 0
 NUM_ICS = 9
@@ -65,6 +74,7 @@ initial_conditions = jnp.stack(jnp.array([initial_thetas, jnp.zeros(NUM_ICS)]), 
 config = {
     "hyperparameters": {
         "layers": LAYERS,
+        "skip_connects": SKIP_CONNECTS_ENABLED,
         "activation_function": ACTIVATION_FUNC,
         "batch_size": BATCH_SIZE,
         "batches_per_epoch": NUM_BATCHES,
@@ -105,6 +115,8 @@ config = {
     "other": {
         "projection": "tanh",
         "slack_weight": SLACK_WEIGHT,
+        "precision_level": x.dtype,
+        "huber_loss_param": huber_delta,
     }
 }
 
@@ -137,15 +149,35 @@ class PINNS(nn.Module):
 
     #     assert all(layer is not None for layer in self.layers)
 
+    @nn.compact
     def __call__(self, x):
         
         def inner_call(x):
+            temp = None
             for i in range(len(self.layers) - 1):
+                if i % 2 == 0 and temp is not None:
+                    if SKIP_CONNECTS_ENABLED:
+                        if x.shape[-1] == temp.shape[-1]:
+                            x = x + temp
+                        else:
+                            temp_proj = nn.Dense(x.shape[-1], name=f"skip_proj_{i}")(temp)
+                            x = x + temp_proj
+
                 x = self.layers[i](x)
                 x = ACTIVATION_FUNC(x)
+
+                if i % 2 == 0:
+                    temp = x
+
             x = self.layers[len(self.layers) - 1](x)   # applying the final layer
+            # h is an additional learnable parameter
+            # it is for calculating the action as -(1 / r) * <g, gradV>
+            # instead we let h = -(1 / r) * g so then action = <h, gradV>
+            # h = jnp.array([x[2], x[3]])
+            x = jnp.array([x[0], x[1]])
             mat = jnp.outer(x, x) + SLACK_WEIGHT * jnp.eye(2)  # slack weight times I2
-            return x.T @ mat @ x + jnp.inner(x, x)
+            value = x.T @ mat @ x + jnp.inner(x, x)
+            return jnp.array([value])
         
         return inner_call(x)
     
@@ -162,6 +194,10 @@ class PINNS(nn.Module):
         cos2 = jnp.cos(2 * theta)
         phase_term = theta * omega
         bounded_omega = omega / (1 + jnp.abs(omega))
+
+        # return jnp.array([sin_theta, cos_theta, omega])
+
+        return jnp.array([sin_theta, cos_theta, omega, omega_squared, bounded_omega, sin2, cos2])
         
         return jnp.array([
             sin_theta,
@@ -183,7 +219,7 @@ def stage_cost_func(theta, omega, action, stepNum):
     # energy = 0.5 * m * (L * omega)**2 + m * G * L * (1 - jnp.cos(theta))
     # energy_diff = 2 * m * G * L - energy
     # energy_part = (1 - curriculum_progress(stepNum)) * energy_diff**2
-    return theta_part + THETADOT_COST_COEFF * omega_diff**2 + ACTION_COST_COEFF_TRAINING * action**2
+    return theta_part + THETADOT_COST_COEFF * jnp.abs(omega_diff) + ACTION_COST_COEFF_TRAINING * action**2
 
 # Not currently in use
 def teacher_stage_cost_func(theta, omega, actionFunc):
@@ -210,17 +246,26 @@ def pinns_loss_hamiltonian(pinn, params, theta, omega, u_func, stepNum):
     u = u_func(theta, omega) # where I had the stop gradient before
     grad_V_wrt_unembedded_state = unembedded_grad_wrt_inputs(pinn, params, theta, omega)
     f_part = jnp.inner(grad_V_wrt_unembedded_state, affine_dynamics_f_func(theta, omega))
-    g_inner_product = jnp.inner(affine_dynamics_g_func(theta, omega), grad_V_wrt_unembedded_state * u_func(theta, omega))
+    g_inner_product = jnp.inner(affine_dynamics_g_func(theta, omega), grad_V_wrt_unembedded_state * u)
     g_part = g_inner_product#  * (1 / ACTION_COST_COEFF_PDE) * g_inner_product
-    hamiltonian = f_part + g_part + stage_cost_func(theta, omega, u_func(theta, omega), stepNum)
-    # hamiltonian = jnp.inner(grad_V_wrt_unembedded_state, affine_dynamics_f_func(theta, omega)) - 0.5 * (1 / action)
-    v0_loss = V0_COST_COEFF * (pinn.apply(params, PINNS.feature_fn(0, 0)) - 0)**2
-    return hamiltonian**2 + v0_loss
+    hamiltonian = f_part + g_part + stage_cost_func(theta, omega, u, stepNum)
+
+    w_theta = (jnp.abs(theta) / jnp.pi)**2
+    w_omega = (jnp.abs(omega) / (2 * m * G * L))**2
+    weights = w_theta + w_omega
+
+    # v0_residual = pinn.apply(params, PINNS.feature_fn(0, 0))
+    # return optax.huber_loss(predictions=hamiltonian, targets=0, delta=huber_delta) + V0_COST_COEFF * optax.huber_loss(predictions=v0_residual, targets=0, delta=huber_delta)
+    
+
+    v0_loss = V0_COST_COEFF * (pinn.apply(params, PINNS.feature_fn(0, 0))[0] - 0)**2
+    return weights * hamiltonian**2 + v0_loss
 
 # Used to enforce the torque limit
 def project(u, stepNum):
+    return u
     # return 0.5 * (umin + umax) * jnp.tanh(0.5 * u)    # did not work
-    return umax * (jnp.tanh(u) + 1) - umax # almost worked
+    # return umax * (jnp.tanh(u) + 1) - umax # almost worked
     # return u
     # p = curriculum_progress(stepNum)
     # appliedBound = NO_LIMIT * (1 - p) + umax * p
@@ -236,7 +281,7 @@ def project(u, stepNum):
 # outputs 2 element array [dV/dtheta, dV/domega]
 # equivalent to the costate in Kaiyuan's code
 def unembedded_grad_wrt_inputs(pinn, params, theta, omega):
-    valueFunc = lambda theta, omega: pinn.apply(params, PINNS.feature_fn(theta, omega))
+    valueFunc = lambda theta, omega: pinn.apply(params, PINNS.feature_fn(theta, omega))[0]
     gradV =  jax.grad(valueFunc, argnums=(0, 1))(theta, omega)
     return jnp.array([gradV[0], gradV[1]])
     # autodiff does chain rule by itself so no need to do manual unembedding
@@ -253,9 +298,12 @@ def unembedded_grad_wrt_inputs(pinn, params, theta, omega):
 # Gives the policy as a function of the value function
 def argmin_hamiltonian_analytic(pinn, params, dynamics_func_g, theta, omega, stepNum):
     # theta = theta - (5*jnp.pi/6 + 0.1)
-    grad_V_wrt_unembedded_state = unembedded_grad_wrt_inputs(pinn, params, theta, omega)    # 2d array but only second elem nonzero
+    # augmented_value = pinn.apply(params, PINNS.feature_fn(theta, omega))
+    # learned_h = jnp.array([augmented_value[1], augmented_value[2]])
+    grad_V_wrt_unembedded_state = unembedded_grad_wrt_inputs(pinn, params, theta, omega)
     # return -1 * (1 / ACTION_COST_COEFF_PDE) * jnp.inner(dynamics_func_g(theta, omega), grad_V_wrt_unembedded_state)
     return project(-1 * (1 / ACTION_COST_COEFF_PDE) * jnp.inner(dynamics_func_g(theta, omega), grad_V_wrt_unembedded_state), stepNum)  # originally negative
+    return project(jnp.inner(learned_h, grad_V_wrt_unembedded_state), stepNum)
 
 def ode(t, y, args):
     # args will be what dynamics_eqn_func needs
@@ -325,7 +373,7 @@ def localSwingUp(theta, thetadot):
 # has no effect when the function returns 1
 def curriculum_progress(step):
     return 1
-    return jnp.clip(6 * step / (EPOCHS * NUM_BATCHES), 0, 1)
+    return jnp.clip(6 * (step + 1) / (EPOCHS), 0, 1)
 
 def train(params, optim, key, run=None):
     opt_state = optim.init(params)
@@ -343,21 +391,44 @@ def train(params, optim, key, run=None):
         return opt_state, params, loss
 
     
-    def sample_online(key):
-        k1, k2 = jax.random.split(key)
+    def sample_uniform(key, num_samples, stepNum):
+        k1, k2, k3, k4, k5, k6, k7, k8 = jax.random.split(key, num=8)
         # uniform randomly samples values from minval to maxval with the given shape
-        ths = jax.random.uniform(k1, (BATCH_SIZE, 1), minval=-GRID_THETA_BOUND, maxval=GRID_THETA_BOUND)
-        dths = jax.random.uniform(k2, (BATCH_SIZE, 1), minval=-GRID_OMEGA_BOUND, maxval=GRID_OMEGA_BOUND)
+        prop = curriculum_progress(stepNum) # between 0 and 1, increases
+        # ths_easy = jax.random.uniform(k1, (int(2 * BATCH_SIZE / 3), 1), minval=-GRID_THETA_BOUND / 2, maxval=GRID_THETA_BOUND / 2)
+        # ths_hard1 = jax.random.uniform(k3, (int(BATCH_SIZE / 6), 1), minval=-GRID_THETA_BOUND, maxval=-GRID_THETA_BOUND / 2)
+        # ths_hard2 = jax.random.uniform(k4, (int(BATCH_SIZE / 6), 1), minval=GRID_THETA_BOUND / 2, maxval=GRID_THETA_BOUND)
+        # dths_easy = jax.random.uniform(k2, (int(BATCH_SIZE / 6), 1), minval=-GRID_OMEGA_BOUND, maxval=GRID_OMEGA_BOUND)
+        # dths_hard1 = jax.random.uniform(k5, (int(5 * BATCH_SIZE / 12), 1), minval=-GRID_OMEGA_BOUND, maxval=-GRID_OMEGA_BOUND / 2)
+        # dths_hard2 = jax.random.uniform(k6, (int(5 * BATCH_SIZE / 12), 1), minval=GRID_OMEGA_BOUND / 2, maxval=GRID_OMEGA_BOUND)
+        # ths = jax.random.permutation(k7, jnp.concatenate([ths_easy, ths_hard1, ths_hard2]))
+        # dths = jax.random.permutation(k8, jnp.concatenate([dths_easy, dths_hard1, dths_hard2]))
+
+        ths = jax.random.uniform(k1, (num_samples, 1), minval=-GRID_THETA_BOUND, maxval=GRID_THETA_BOUND)
+        dths = jax.random.uniform(k3, (num_samples, 1), minval=-GRID_OMEGA_BOUND, maxval=GRID_OMEGA_BOUND)
         return jnp.squeeze(jnp.stack([ths, dths], axis=-1))
     
 
     print("Learning from random sampling")
+    theta_range = (-GRID_THETA_BOUND, GRID_THETA_BOUND)
+    omega_range = (-GRID_OMEGA_BOUND, GRID_OMEGA_BOUND)
+    states, theta_lin, omega_lin, theta_grid, omega_grid = create_space_grid(theta_range, omega_range)
+    policy = lambda theta, omega: argmin_hamiltonian_analytic(pinn, params, affine_dynamics_g_func, theta, omega, stepNum=100000)
+    residual_func = lambda state: pinns_loss_hamiltonian(pinn, params, state[0], state[1], policy, 100000)
+    residuals = None
+    weights = None
     for epoch in range(EPOCHS):
         epoch_loss = 0
+        if epoch % UPDATE_RESIDS_EVERY == 0:
+            residuals = jax.vmap(residual_func)(states)
+            plot_residual_heatmap(theta_grid, omega_grid, residuals, step=epoch)
+            print(f"Epoch {epoch}: max residual = {jnp.max(residuals):.2f}, mean = {jnp.mean(residuals):.2f}")
+
         for batch in range(NUM_BATCHES):
             new_key, subkey = jax.random.split(new_key)
-            random_sampled_states = sample_online(subkey)
-            opt_state, params, loss = make_step(opt_state, params, random_sampled_states, epoch * NUM_BATCHES + batch)
+            random_sampled_states = mixed_sample(states, residuals, theta_range, omega_range, theta_grid.shape, BATCH_SIZE, P_UNIFORM_SAMPLING, subkey)
+            # random_sampled_states = uniform_sample(theta_range, omega_range, BATCH_SIZE, subkey)
+            opt_state, params, loss = make_step(opt_state, params, random_sampled_states, stepNum=epoch)
             if not run == None:
                 run.log({"loss": loss})
             epoch_loss += loss
@@ -372,6 +443,114 @@ def train(params, optim, key, run=None):
     
     return params, losses
 
+# The next few functions evaluate residuals over the state space
+# And also help find where the high residuals are
+# And also help to plot the residual map (used for after training as usual
+# but also possible to do it during training now and see it update)
+def create_space_grid(theta_range, omega_range, grid_size=(50, 50)):
+    theta_lin = jnp.linspace(*theta_range, grid_size[0])
+    omega_lin = jnp.linspace(*omega_range, grid_size[1])
+    theta_grid, omega_grid = jnp.meshgrid(theta_lin, omega_lin, indexing='ij')
+    states = jnp.stack([theta_grid.ravel(), omega_grid.ravel()], axis=-1)
+    return states, theta_lin, omega_lin, theta_grid, omega_grid
+# residuals = residual_fn(states)
+# residuals_grid = residuals.reshape(grid_size)
+# do these after create_space_grid to get it ready for plotting
+
+def continuous_residual_density(x, grid_states, residuals, bandwidth=0.5):
+    # RBF kernel weight for each sample x vs each grid point
+    # x: [N, 2], grid_states: [G, 2], residuals: [G]
+    
+    @jax.jit
+    def rbf(xi):
+        dists = jnp.linalg.norm(grid_states - xi, axis=1)  # [G]
+        weights = jnp.exp(-0.5 * (dists / bandwidth) ** 2)  # [G]
+        return jnp.sum(weights * residuals)
+
+    return jax.vmap(rbf)(x)  # returns [N]
+
+@jax.jit
+def fast_continuous_residual_density(xs, grid_states, residuals, bandwidth):
+    diff = xs[:, None, :] - grid_states[None, :, :]
+    sq_distances = jnp.sum(diff ** 2, axis=-1)
+    weights = jnp.exp(-0.5 * sq_distances / (bandwidth ** 2))
+    return weights @ residuals
+
+@jax.jit
+def inverse_distance_weighting(xs, grid_states, residuals, p=2, epsilon=1e-6):
+    # xs: [N, 2], grid_states: [G, 2], residuals: [G]
+    diff = xs[:, None, :] - grid_states[None, :, :]  # [N, G, 2]
+    dists = jnp.linalg.norm(diff, axis=-1) + epsilon  # [N, G]
+    weights = 1.0 / (dists ** p)  # decay ~ 1/r^p
+    weighted_sum = weights @ residuals  # [N]
+    norm = jnp.sum(weights, axis=1)
+    return weighted_sum / norm
+
+def sample_weighted_from_domain(grid_states, residuals, theta_range, omega_range, grid_size, num_samples, key, bandwidth=0.5):
+
+    # Sample uniform candidates
+    key1, key2 = jax.random.split(key)
+    theta_samples = jax.random.uniform(key1, (num_samples * 5,), minval=theta_range[0], maxval=theta_range[1])
+    omega_samples = jax.random.uniform(key2, (num_samples * 5,), minval=omega_range[0], maxval=omega_range[1])
+    candidates = jnp.stack([theta_samples, omega_samples], axis=-1)  # [M, 2]
+
+    # Compute smooth density
+    density = inverse_distance_weighting(candidates, grid_states, residuals)
+    # density = continuous_residual_density(candidates, grid_states, residuals, bandwidth=bandwidth)
+    # density = density / jnp.max(density)  # Normalize to [0, 1]
+
+    # Rejection sampling
+    key_reject = jax.random.PRNGKey(999)
+    accept_prob = jax.random.uniform(key_reject, (len(candidates),))
+    accepted = candidates[accept_prob < density]
+    
+    # Return first N accepted samples
+    return accepted[:num_samples]
+
+# def compute_sampling_weights(residuals, threshold_ratio=0.7):
+#     threshold = jnp.quantile(residuals, threshold_ratio)
+#     weights = jnp.where(residuals > threshold, residuals, 0.0)
+#     weights = weights / jnp.sum(weights)
+#     return weights
+
+# def weighted_sample(states, weights, num_samples, key):
+#     idx = jax.random.choice(key, len(states), shape=(num_samples,), p=weights)
+#     return states[idx]
+
+def uniform_sample(theta_range, omega_range, num_samples, key):
+    k1, k2 = jax.random.split(key)
+    ths = jax.random.uniform(k1, (num_samples, 1), minval=theta_range[0], maxval=theta_range[1])
+    dths = jax.random.uniform(k2, (num_samples, 1), minval=omega_range[0], maxval=omega_range[1])
+    return jnp.squeeze(jnp.stack([ths, dths], axis=-1))
+
+def mixed_sample(states, residuals, theta_range, omega_range, grid_size, num_samples, uniform_prop, key):
+    w_key, u_key = jax.random.split(key)
+    num_uniform = int(uniform_prop * num_samples)
+    num_weighted = num_samples - num_uniform
+
+    weighted = sample_weighted_from_domain(states, residuals, theta_range, omega_range, grid_size, num_weighted, w_key)
+
+    uniform = uniform_sample(theta_range, omega_range, num_uniform, u_key)
+
+    mixed = jnp.concatenate([weighted, uniform], axis=0)
+    return mixed
+
+def plot_residual_heatmap(theta_grid, omega_grid, residuals_grid, step=None, cmap="coolwarm", path="./residuals"):
+    plt.figure(figsize=(6, 5))
+    residuals_grid = jnp.log(residuals_grid)
+    residuals_grid = residuals_grid.reshape(theta_grid.shape)
+    plt.contourf(theta_grid, omega_grid, residuals_grid, 100, cmap=cmap)
+    plt.colorbar(label='Residual')
+    plt.xlabel("θ (theta)")
+    plt.ylabel("ω (omega)")
+    title = f"Residual Heatmap"
+    if step is not None:
+        title += f" at Step {step}"
+    plt.title(title)
+    plt.savefig(f"{path}/residual_step_{step:04d}.png")
+    plt.close()
+
+
 if __name__ == "__main__":
     new_key, subkey = jax.random.split(key)
     del key
@@ -383,9 +562,9 @@ if __name__ == "__main__":
     params = pinn.init(subkey2, init_input)
     del subkey2
 
-    V_fn = lambda state: pinn.apply(params, state)
+    V_fn = lambda state: pinn.apply(params, state)[0]
     grad_fn = jax.grad(V_fn)
-    value_val = pinn.apply(params, PINNS.feature_fn(0, 0))
+    value_val = pinn.apply(params, PINNS.feature_fn(0, 0))[0]
     jax.debug.print('V before training at (0, 0) = {})', value_val)
     grad_val = grad_fn(PINNS.feature_fn(0, 0))
     jax.debug.print("∇V wrt input before training at (0, 0) = {}", grad_val)
@@ -393,11 +572,15 @@ if __name__ == "__main__":
 
 
     
-    optim = optax.adam(LEARNING_RATE)
+    optim = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(LEARNING_RATE)
+    )
     new_key3, subkey3 = jax.random.split(new_key2)
     del new_key2
     wandb.login()
-    run_name = "New features framework tanh projection saturated"
+    # run_name = "LogNorm uniform sampling optax clip twice wide omega sampling float64 normal features no projection unsaturated"
+    run_name = "LogNorm adaptive sampling optax clip far weighted L1 omega norm twice wide omega sampling float64 omega_squared bounded_omega fourier features no projection unsaturated"
     run = None
     run = wandb.init(
         entity="k5wang-main-university-of-southern-california",
@@ -405,10 +588,10 @@ if __name__ == "__main__":
         name=run_name,
         config=config,
         notes="From VSCode",
-        tags=["test", "tanh", "soft-saturate"]
+        tags=["test"]
     )
     params, losses = train(params, optim, subkey3, run)
-    print("V at (0, 0): {}", pinn.apply(params, PINNS.feature_fn(0, 0)))
+    print("V at (0, 0): {}", pinn.apply(params, PINNS.feature_fn(0, 0))[0])
 
     def policyFromValueFunc(theta, omega):
         return argmin_hamiltonian_analytic(pinn, params, affine_dynamics_g_func, theta, omega, EPOCHS * NUM_BATCHES)
@@ -417,8 +600,8 @@ if __name__ == "__main__":
         return valuePolicy(theta, omega)
     
     nxs, nys = 100,100
-    grid_theta = jnp.linspace(-jnp.pi, jnp.pi, nxs)
-    grid_omega = jnp.linspace(-m*G*L, m*G*L, nys)
+    grid_theta = jnp.linspace(-GRID_THETA_BOUND, GRID_THETA_BOUND, nxs)
+    grid_omega = jnp.linspace(-GRID_OMEGA_BOUND, GRID_OMEGA_BOUND, nys)
     xv, yv = jnp.meshgrid(grid_theta, grid_omega)
     grid_states = jnp.stack([xv.ravel(), yv.ravel()], axis=-1)  # shape (10000, 2)
 
@@ -436,17 +619,33 @@ if __name__ == "__main__":
     axs[0, 1].set_title("Control Action From Swing Up Policy")
 
     plt.colorbar(contour2, ax=axs[0, 1])
-    valueNetVals = jax.vmap(lambda x: pinn.apply(params, PINNS.feature_fn(x[0], x[1])))(grid_states)
+    valueNetVals = jax.vmap(lambda x: pinn.apply(params, PINNS.feature_fn(x[0], x[1]))[0])(grid_states)
     vn_grid = valueNetVals.reshape(xv.shape)
     contour3 = axs[1, 0].contourf(xv, yv, vn_grid, levels=50, cmap="coolwarm")
     axs[1, 0].set_title("Value network outputs on variety of states")
-
     plt.colorbar(contour3, ax=axs[1, 0])
-    hjbLossVals = jax.vmap(lambda x: pinns_loss_hamiltonian(pinn, params, x[0], x[1], policyFromValueFunc, stepNum=(EPOCHS * NUM_BATCHES)))(grid_states)
+
+    hjbLossVals = jax.vmap(lambda x: pinns_loss_hamiltonian(pinn, params, x[0], x[1], policyFromValueFunc, stepNum=(EPOCHS)))(grid_states)
+
+    print(f"Average hjb loss across the whole grid: {jnp.mean(hjbLossVals)}")
+    max_r = jnp.max(hjbLossVals)
+    print(f"Max residual = {max_r:.2e}")
+    temp = hjbLossVals.reshape(xv.shape)
+    high_idx = jnp.squeeze(jnp.array([jnp.unravel_index(jnp.argmax(temp), temp.shape)]))
+    print(high_idx)
+    theta_bad = xv[0][high_idx[0]]
+    omega_bad = yv[0][high_idx[1]]
+    print(f"Highest residual at (θ, ω) = {theta_bad}, {omega_bad}")
+    value_fn = lambda state: pinn.apply(params, PINNS.feature_fn(x[0], x[1]))[0]
+    v, grad_v = jax.value_and_grad(value_fn)(jnp.array([theta_bad, omega_bad]))
+    print(f"value func there: {v}, grad wrt state there: {grad_v}")
+
     # hjbLossVals = jnp.log(hjbLossVals)
+    jnp.clip(hjbLossVals, 1e-12, None)
     hjbLoss_grid = hjbLossVals.reshape(xv.shape)
-    contour4 = axs[1, 1].contourf(xv, yv, hjbLoss_grid, levels=50, cmap="coolwarm")
+    contour4 = axs[1, 1].contourf(xv, yv, hjbLoss_grid, norm=LogNorm(), levels=50, cmap="coolwarm")
     axs[1, 1].contour(xv, yv, hjbLoss_grid, levels=[-1, 0], colors="black", linewidths=2)
+    axs[1, 1].contour(xv, yv, hjbLoss_grid, levels=[1, 2], colors="green", linewidths=2)
     axs[1, 1].set_title("HJB residual on variety of states")
     plt.colorbar(contour4, ax=axs[1, 1])
     
