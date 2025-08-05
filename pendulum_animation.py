@@ -131,6 +131,7 @@ def simulateWithDiffraxIntegration(ode, torque_calc, t_stop, dt, theta_initial, 
     writer = Writer(fps=15, metadata=dict(artist='Me'), bitrate=1800)
     filename = f"E:\\usc sure\\hjpo\\{run_name}.mp4"
     ani.save(filename=filename, writer=writer)
+    plt.close(fig=animationFig)
 
 
 
