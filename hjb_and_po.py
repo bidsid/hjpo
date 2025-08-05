@@ -9,6 +9,7 @@ from diffrax import diffeqsolve, ODETerm, SaveAt, Heun
 import optax
 from tqdm import tqdm
 from pendulum_animation import simulateWithDiffraxIntegration, swingUpU
+import sampling
 import integration
 import jax.tree_util as jtu
 import matplotlib.pyplot as plt
@@ -28,7 +29,7 @@ NUM_GRID_THETA_POINTS = 100
 NUM_GRID_OMEGA_POINTS = 300
 NUM_GRID_POINTS = NUM_GRID_THETA_POINTS * NUM_GRID_OMEGA_POINTS
 NUM_BATCHES = 10    # per epoch
-BATCH_SIZE = 6000# int(NUM_GRID_POINTS / NUM_BATCHES)
+BATCH_SIZE = 3000# int(NUM_GRID_POINTS / NUM_BATCHES)
 PO_IC_BATCH_SIZE = 10
 LEARNING_RATE = 3e-3
 STEPS = 300
@@ -41,6 +42,8 @@ ACTION_COST_COEFF_TRAINING = 0.01   # R in the writeup
 ACTION_COST_COEFF_PDE = ACTION_COST_COEFF_TRAINING
 V0_COST_COEFF = 200
 TERMINAL_COST_COEFF = 10
+UPDATE_RESIDS_EVERY = 5
+P_UNIFORM_SAMPLING = 0.2
 SLACK_WEIGHT = 1e-1
 RANDOM_THETA_AMP = 0
 RANDOM_OMEGA_AMP = jnp.pi
@@ -84,6 +87,8 @@ config = {
         "epochs": EPOCHS,
         "learning_rate": LEARNING_RATE,
         "hjpo_tradeoff_factor": HJPO_TRADEOFF,
+        "adaptive_recalc_resids_every": UPDATE_RESIDS_EVERY,
+        "uniform_sampling_prob": P_UNIFORM_SAMPLING,
     },
 
     "sampling": {
@@ -257,13 +262,13 @@ def augmented_ode(t, y, args):
     # args will be what dynamics_eqn_func needs
     # also tracks loss to see what the total loss across the trajectory is
     theta, omega, J = y
-    policy_action_func, teacher_action_func = args
+    policy_action_func = args
     dtheta = omega
     domega = dynamics_eqn_func(theta, omega, policy_action_func)[1]
-    dJ = teacher_stage_cost_func(theta, omega, teacher_action_func(theta, omega), policy_action_func(theta, omega), stepNum=10000)
+    dJ = stage_cost_func(theta, omega, policy_action_func(theta, omega), stepNum=10000)
     return jnp.array([dtheta, domega, dJ])
 
-def po_loss_rollout(policy_action_func, teacher_action_func, rollout_ic, stepNum):
+def po_loss_rollout(policy_action_func, rollout_ic, stepNum):
     
     term = ODETerm(augmented_ode)
     solver = Heun()
@@ -275,7 +280,7 @@ def po_loss_rollout(policy_action_func, teacher_action_func, rollout_ic, stepNum
         dt0=dt,
         y0=jnp.array([rollout_ic[0], rollout_ic[1], 0]),
         saveat=SaveAt(ts=t),
-        args=(policy_action_func, teacher_action_func)
+        args=(policy_action_func)
     )
     
     lastIndex = len(sol.ts) - 1
@@ -283,6 +288,7 @@ def po_loss_rollout(policy_action_func, teacher_action_func, rollout_ic, stepNum
     omegaFinal = sol.ys[:,1][lastIndex]
     actionFinal = policy_action_func(thetaFinal, omegaFinal)
     jFinal = sol.ys[:,2][lastIndex]
+    v0_manual_cost = V0_COST_COEFF * (policy_action_func(0, 0) - 0)**2
     return jFinal + terminal_stage_cost_func(thetaFinal, omegaFinal, actionFinal)
 
 def hjb_batched_loss(params, input_states, stepNum):
@@ -294,7 +300,7 @@ def hjb_batched_loss(params, input_states, stepNum):
     # bound_violation_loss = jnp.mean(jax.vmap(lambda input_state: bfv(actionFromValue(input_state[0], input_state[1]) - umax) + bfv(-umax - actionFromValue(input_state[0], input_state[1])))(input_states))
     return  original_hamiltonian_loss
 
-def po_batched_loss_teacher(policy_params, pinn_params, batch_ics, stepNum):
+def supervised_po_batched_loss(policy_params, pinn_params, input_states, stepNum):
     pinn = PINNS(features=HJB_NN_LAYERS)
     policy = MLP(features=PO_NN_LAYERS)
     valueActionFunc = lambda t, o: argmin_hamiltonian_analytic(pinn, pinn_params, affine_dynamics_g_func, t, o, stepNum)
@@ -303,7 +309,7 @@ def po_batched_loss_teacher(policy_params, pinn_params, batch_ics, stepNum):
     # runs the rollout and calculates the loss for each of the initial conditions specified at the top
     # Then takes the mean of that
     # so the batch is the initial conditions
-    return jnp.mean(jax.vmap(lambda batch_ic: po_loss_rollout(policyActionFunc, valueActionFunc, batch_ic, stepNum))(batch_ics))
+    return jnp.mean(jax.vmap(lambda state: supervised_cost_func(state[0], state[1], valueActionFunc(state[0], state[1]), policyActionFunc(state[0], state[1]), stepNum))(input_states))
 
 # Effectively sets the teacher action function in the above version to the same thing
 # as the policy network's action function. Since the teacher_stage_cost_function
@@ -314,14 +320,14 @@ def po_batched_loss(policy_params, batch_ics, stepNum):
     policy = MLP(features=PO_NN_LAYERS)
     policyActionFunc = lambda t, o: policy.apply(policy_params, MLP.feature_fn(t, o))
     
-    return jnp.mean(jax.vmap(lambda batch_ic: po_loss_rollout(policyActionFunc, policyActionFunc, batch_ic, stepNum))(batch_ics))
+    return jnp.mean(jax.vmap(lambda batch_ic: po_loss_rollout(policyActionFunc, batch_ic, stepNum))(batch_ics))
 
 def hjpo_batched_loss(params, po_ics, hjb_input_states, stepNum):
     pinn = PINNS(features=HJB_NN_LAYERS)
     actionFromValue = lambda t, o: argmin_hamiltonian_analytic(pinn, params, affine_dynamics_g_func, t, o, stepNum)
 
     total_hjb_loss = jnp.mean(jax.vmap(lambda input_state: pinns_loss_hamiltonian(pinn, params, input_state[0], input_state[1], actionFromValue, stepNum))(hjb_input_states))
-    total_po_loss = jnp.mean(jax.vmap(lambda batch_ic: po_loss_rollout(actionFromValue, actionFromValue, batch_ic, stepNum))(po_ics))
+    total_po_loss = jnp.mean(jax.vmap(lambda batch_ic: po_loss_rollout(actionFromValue, batch_ic, stepNum))(po_ics))
 
 
     # rv = 0
@@ -329,8 +335,16 @@ def hjpo_batched_loss(params, po_ics, hjb_input_states, stepNum):
     
     # return rv
     return HJPO_TRADEOFF * total_po_loss + (1 - HJPO_TRADEOFF) * total_hjb_loss
-    
 
+def sample_ics(key, stepNum):
+        k1, k2 = jax.random.split(key)
+        # uniform randomly samples values from minval to maxval with the given shape
+        # prop = curriculum_progress(stepNum) # between 0 and 1, increases
+        prop = 1
+        ths = jax.random.uniform(k1, (PO_IC_BATCH_SIZE, 1), minval=-GRID_THETA_BOUND * prop, maxval=GRID_THETA_BOUND * prop)
+        dths = jax.random.uniform(k2, (PO_IC_BATCH_SIZE, 1), minval=-GRID_OMEGA_BOUND * prop, maxval=GRID_OMEGA_BOUND * prop)
+        return jnp.squeeze(jnp.stack([ths, dths], axis=-1))
+    
 # Not used
 def localSwingUp(theta, thetadot):
         # Energy at bottom is 0, energy at top = goal = 2mgl
@@ -350,13 +364,21 @@ def curriculum_progress(step):
     return 1
     return jnp.clip(6 * (step + 1) / (EPOCHS), 0, 1)
 
+theta_range = (-GRID_THETA_BOUND, GRID_THETA_BOUND)
+omega_range = (-GRID_OMEGA_BOUND, GRID_OMEGA_BOUND)
+states, theta_lin, omega_lin, theta_grid, omega_grid = sampling.create_space_grid(theta_range, omega_range)
+
 def train_hjb(params, optim, key, run=None):
     opt_state = optim.init(params)
     losses = [0] * EPOCHS
     NUM_RANDOM_DIM = 10
-    new_key, subkey = jax.random.split(key)    
+    new_key, subkey = jax.random.split(key)
 
-    
+    pinn = PINNS(features=HJB_NN_LAYERS)
+    valuePolicy = lambda theta, omega: argmin_hamiltonian_analytic(pinn, params, affine_dynamics_g_func, theta, omega, stepNum=100000)
+    residual_func = lambda state: pinns_loss_hamiltonian(pinn, params, state[0], state[1], valuePolicy, 100000)
+    residuals = None  
+
     @jax.jit
     def make_step(opt_state, params, random_states, stepNum):
 
@@ -364,23 +386,17 @@ def train_hjb(params, optim, key, run=None):
         updates, opt_state = optim.update(grads, opt_state)
         params = optax.apply_updates(params, updates)
         return opt_state, params, loss
-
-    
-    def sample_online(key, stepNum):
-        k1, k2 = jax.random.split(key)
-        # uniform randomly samples values from minval to maxval with the given shape
-        prop = curriculum_progress(stepNum) # between 0 and 1, increases
-        ths = jax.random.uniform(k1, (BATCH_SIZE, 1), minval=-GRID_THETA_BOUND * prop, maxval=GRID_THETA_BOUND * prop)
-        dths = jax.random.uniform(k2, (BATCH_SIZE, 1), minval=-GRID_OMEGA_BOUND * prop, maxval=GRID_OMEGA_BOUND * prop)
-        return jnp.squeeze(jnp.stack([ths, dths], axis=-1))
     
 
     print("HJB: Learning from random sampling")
     for epoch in range(EPOCHS):
         epoch_loss = 0
+        if epoch % UPDATE_RESIDS_EVERY == 0:
+            residuals = jax.vmap(residual_func)(states)
         for batch in range(NUM_BATCHES):
             new_key, subkey = jax.random.split(new_key)
-            random_sampled_states = sample_online(subkey, stepNum=epoch)
+            random_sampled_states = sampling.mixed_sample(states, residuals, theta_range, omega_range, theta_grid.shape, BATCH_SIZE, P_UNIFORM_SAMPLING, subkey)
+            # random_sampled_states = sample_online(subkey, stepNum=epoch)
             opt_state, params, loss = make_step(opt_state, params, random_sampled_states, stepNum=epoch)
             if not run == None:
                 run.log({"hjb_loss": loss})
@@ -402,15 +418,11 @@ def train_po(params, optim, key, teacherParams=None, run=None):
     NUM_RANDOM_DIM = 10
     new_key, subkey = jax.random.split(key)
 
-    def sample_ics(key, stepNum):
-        k1, k2 = jax.random.split(key)
-        # uniform randomly samples values from minval to maxval with the given shape
-        # prop = curriculum_progress(stepNum) # between 0 and 1, increases
-        prop = 1
-        ths = jax.random.uniform(k1, (PO_IC_BATCH_SIZE, 1), minval=-GRID_THETA_BOUND * prop, maxval=GRID_THETA_BOUND * prop)
-        dths = jax.random.uniform(k2, (PO_IC_BATCH_SIZE, 1), minval=-GRID_OMEGA_BOUND * prop, maxval=GRID_OMEGA_BOUND * prop)
-        return jnp.squeeze(jnp.stack([ths, dths], axis=-1))
-
+    if not teacherParams == None:
+        pinn = PINNS(features=HJB_NN_LAYERS)
+        valuePolicy = lambda theta, omega: argmin_hamiltonian_analytic(pinn, teacherParams, affine_dynamics_g_func, theta, omega, stepNum=100000)
+        residual_func = lambda state: pinns_loss_hamiltonian(pinn, teacherParams, state[0], state[1], valuePolicy, 100000)
+        residuals = None
 
     @jax.jit
     def make_step(opt_state, params, sampled_ics, stepNum):
@@ -421,26 +433,31 @@ def train_po(params, optim, key, teacherParams=None, run=None):
         return opt_state, params, loss
     
     @jax.jit
-    def make_step_teacher(opt_state, params, teacher_params, sampled_ics, stepNum):
+    def supervised_make_step(opt_state, params, teacher_params, input_states, stepNum):
 
-        loss, grads = jax.value_and_grad(po_batched_loss_teacher)(params, teacher_params, sampled_ics, stepNum)
+        loss, grads = jax.value_and_grad(supervised_po_batched_loss)(params, teacher_params, input_states, stepNum)
         updates, opt_state = optim.update(grads, opt_state)
         params = optax.apply_updates(params, updates)
         return opt_state, params, loss
     
-
-    print("PO: Learning from rollouts")
+    addition_Str = ""
+    if not teacherParams == None:
+        addition_Str = " Supervised learning "
+    print("PO:" + addition_Str + "then learning from rollouts")
     for epoch in range(EPOCHS):
         epoch_loss = 0
         for batch in range(NUM_BATCHES):
             new_key, subkey = jax.random.split(new_key)
-            sampled_ics = sample_ics(subkey, stepNum=epoch)
             if teacherParams == None or epoch > EPOCHS / 2:
+                sampled_ics = sample_ics(subkey, stepNum=epoch)
                 opt_state, params, loss = make_step(opt_state, params, sampled_ics, stepNum=epoch)
             else:
-                opt_state, params, loss = make_step_teacher(opt_state, params, teacherParams, sampled_ics, stepNum=epoch)
+                if epoch % UPDATE_RESIDS_EVERY == 0:
+                    residuals = jax.vmap(residual_func)(states)
+                input_states = sampling.mixed_sample(states, residuals, theta_range, omega_range, theta_grid.shape, BATCH_SIZE, P_UNIFORM_SAMPLING, subkey)
+                opt_state, params, loss = supervised_make_step(opt_state, params, teacherParams, input_states, stepNum=epoch)
             if not run == None:
-                teacher_str = "" if teacherParams == None else "_teacher"
+                teacher_str = "" if teacherParams == None else "_supervised"
                 loss_log_str = "po_loss" + teacher_str
                 run.log({loss_log_str: loss})
             epoch_loss += loss
@@ -462,22 +479,10 @@ def train_hjpo(params, optim, key, run=None):
     NUM_RANDOM_DIM = 10
     new_key, subkey = jax.random.split(key)
 
-    def sample_ics(key, stepNum):
-        k1, k2 = jax.random.split(key)
-        # uniform randomly samples values from minval to maxval with the given shape
-        # prop = curriculum_progress(stepNum) # between 0 and 1, increases
-        prop = 1
-        ths = jax.random.uniform(k1, (PO_IC_BATCH_SIZE, 1), minval=-GRID_THETA_BOUND * prop, maxval=GRID_THETA_BOUND * prop)
-        dths = jax.random.uniform(k2, (PO_IC_BATCH_SIZE, 1), minval=-GRID_OMEGA_BOUND * prop, maxval=GRID_OMEGA_BOUND * prop)
-        return jnp.squeeze(jnp.stack([ths, dths], axis=-1))
-    
-    def sample_online(key, stepNum):
-        k1, k2 = jax.random.split(key)
-        # uniform randomly samples values from minval to maxval with the given shape
-        prop = curriculum_progress(stepNum) # between 0 and 1, increases
-        ths = jax.random.uniform(k1, (BATCH_SIZE, 1), minval=-GRID_THETA_BOUND * prop, maxval=GRID_THETA_BOUND * prop)
-        dths = jax.random.uniform(k2, (BATCH_SIZE, 1), minval=-GRID_OMEGA_BOUND * prop, maxval=GRID_OMEGA_BOUND * prop)
-        return jnp.squeeze(jnp.stack([ths, dths], axis=-1))
+    pinn = PINNS(features=HJB_NN_LAYERS)
+    policy = lambda theta, omega: argmin_hamiltonian_analytic(pinn, params, affine_dynamics_g_func, theta, omega, stepNum=100000)
+    residual_func = lambda state: pinns_loss_hamiltonian(pinn, params, state[0], state[1], policy, 100000)
+    residuals = None 
 
 
     @jax.jit
@@ -493,9 +498,12 @@ def train_hjpo(params, optim, key, run=None):
     for epoch in range(EPOCHS):
         epoch_loss = 0
         for batch in range(NUM_BATCHES):
+            if epoch % UPDATE_RESIDS_EVERY == 0:
+                residuals = jax.vmap(residual_func)(states)
             new_key, subkey1, subkey2 = jax.random.split(new_key, 3)
             po_sampled_ics = sample_ics(subkey1, stepNum=epoch)
-            hjb_sampled_input_states = sample_online(subkey2, stepNum=epoch)
+            hjb_sampled_input_states = sampling.mixed_sample(states, residuals, theta_range, omega_range, theta_grid.shape, BATCH_SIZE, P_UNIFORM_SAMPLING, subkey2)
+            # hjb_sampled_input_states = sample_online(subkey2, stepNum=epoch)
             
             opt_state, params, loss = make_step(opt_state, params, po_sampled_ics, hjb_sampled_input_states, stepNum=epoch)
             if not run == None:
@@ -548,9 +556,7 @@ if __name__ == "__main__":
     new_key3, subkey3 = jax.random.split(new_key2)
     del new_key2
     wandb.login()
-    run_name = "Alternating joint HJPO test l2 omega norm far weighted"
-    # run_name = "True joint HJPO optax clip L1 omega norm float64 omega_squared bounded_omega fourier features no projection unsaturated"
-    # run_name = "HJPO HJB Teacher optax clip L1 omega norm float64 omega_squared bounded_omega fourier features no projection unsaturated"
+    run_name = "HJB supervising PO adaptive sampling optax clip L1 omega norm float64 omega_squared bounded_omega fourier features no projection unsaturated 2"
     run = None
     run = wandb.init(
         entity="k5wang-main-university-of-southern-california",
@@ -633,44 +639,43 @@ if __name__ == "__main__":
         return networkPolicy(theta, omega)
     def policyFromValueFunc(theta, omega):
         return argmin_hamiltonian_analytic(pinn, hjb_params, affine_dynamics_g_func, theta, omega, EPOCHS * NUM_BATCHES)
-    def hjpoPolicyFromValueFunc(theta, omega):
-        return argmin_hamiltonian_analytic(pinn, hjpo_params, affine_dynamics_g_func, theta, omega, EPOCHS * NUM_BATCHES)
+    # def hjpoPolicyFromValueFunc(theta, omega):
+    #     return argmin_hamiltonian_analytic(pinn, hjpo_params, affine_dynamics_g_func, theta, omega, EPOCHS * NUM_BATCHES)
     def valuePolicyTorqueCalc(valuePolicy, *fluff_args, theta, omega):
         # This might be returning some wrong values in extreme cases
         return valuePolicy(theta, omega)
 
     # TRAINING PO NO TEACHER
-    # po_params_pre, po_losses_pre = train_po(po_params, optim_po_pre, subkey3, teacherParams=None, run=run)
-    # po_params = po_params_pre
+    po_params_pre, po_losses_pre = train_po(po_params, optim_po_pre, subkey3, teacherParams=None, run=run)
+    po_params = po_params_pre
     
-
     # TRAINING HJB
-    # hjb_params, hjb_losses = train_hjb(hjb_params, optim_hjb, subkey3, run=run)
-    # print("HJB Value Function at (0, 0): {}", pinn.apply(hjb_params, PINNS.feature_fn(0, 0)))    
+    hjb_params, hjb_losses = train_hjb(hjb_params, optim_hjb, subkey3, run=run)
+    print("HJB Value Function at (0, 0): {}", pinn.apply(hjb_params, PINNS.feature_fn(0, 0)))    
 
-    # TRAINING PO WITH HJB TEACHER
-    # po_params_post, po_losses_post = train_po(po_params2, optim_po_post, subkey3, teacherParams=hjb_params, run=run)
-    # print("Policy network at (0, 0): {}", po_net.apply(po_params_post, MLP.feature_fn(0, 0)))
-    # po_params2 = po_params_post
+    # TRAINING PO WITH HJB SUPERVISION
+    po_params_post, po_losses_post = train_po(po_params2, optim_po_post, subkey3, teacherParams=hjb_params, run=run)
+    print("Policy network at (0, 0): {}", po_net.apply(po_params_post, MLP.feature_fn(0, 0)))
+    po_params2 = po_params_post
 
     # JOINT HJPO OPTIMIZATION
-    hjpo_params, hjpo_losses = train_hjpo(hjb_params2, optim_hjpo, subkey3, run=run)
-    print("HJPO Value Function at (0, 0): {}", pinn.apply(hjpo_params, MLP.feature_fn(0, 0)))
+    # hjpo_params, hjpo_losses = train_hjpo(hjb_params2, optim_hjpo, subkey3, run=run)
+    # print("HJPO Value Function at (0, 0): {}", pinn.apply(hjpo_params, MLP.feature_fn(0, 0)))
 
 
     # DOING ALL THE PLOTTING AFTERWARD
-    # po_pre_fig, po_pre_axs = plt.subplots(2, 2, figsize=(20, 10))
-    # createPlotsAndSimulate(po_params_pre, po_net, policyFromPolicyNetworkPre, networkPolicyTorqueCalc, 
-                           # po_pre_fig, po_pre_axs, "Policy Optimization Without Teacher (ignore bottom two plots)")
-    # hjb_fig, hjb_axs = plt.subplots(2, 2, figsize=(20, 10))
-    # createPlotsAndSimulate(hjb_params, pinn, policyFromValueFunc, valuePolicyTorqueCalc, 
-                           # hjb_fig, hjb_axs, "HJB With PINN")
-    # po_post_fig, po_post_axs = plt.subplots(2, 2, figsize=(20, 10))
-    # createPlotsAndSimulate(po_params_post, po_net, policyFromPolicyNetworkPost, networkPolicyTorqueCalc, 
-    #                        po_post_fig, po_post_axs, "Policy Optimization Trained by HJB (ignore bottom 2 plots)")
-    hjpo_fig, hjpo_axs = plt.subplots(2, 2, figsize=(20, 10))
-    createPlotsAndSimulate(hjpo_params, pinn, hjpoPolicyFromValueFunc, valuePolicyTorqueCalc,
-                           hjpo_fig, hjpo_axs, "Joint HJPO")
+    po_pre_fig, po_pre_axs = plt.subplots(2, 2, figsize=(20, 10))
+    createPlotsAndSimulate(po_params_pre, po_net, policyFromPolicyNetworkPre, networkPolicyTorqueCalc, 
+                           po_pre_fig, po_pre_axs, "Policy Optimization Without Teacher (ignore bottom two plots)")
+    hjb_fig, hjb_axs = plt.subplots(2, 2, figsize=(20, 10))
+    createPlotsAndSimulate(hjb_params, pinn, policyFromValueFunc, valuePolicyTorqueCalc, 
+                           hjb_fig, hjb_axs, "HJB With PINN")
+    po_post_fig, po_post_axs = plt.subplots(2, 2, figsize=(20, 10))
+    createPlotsAndSimulate(po_params_post, po_net, policyFromPolicyNetworkPost, networkPolicyTorqueCalc, 
+                           po_post_fig, po_post_axs, "Policy Optimization Trained by HJB (ignore bottom 2 plots)")
+    # hjpo_fig, hjpo_axs = plt.subplots(2, 2, figsize=(20, 10))
+    # createPlotsAndSimulate(hjpo_params, pinn, hjpoPolicyFromValueFunc, valuePolicyTorqueCalc,
+    #                        hjpo_fig, hjpo_axs, "Joint HJPO")
     
     if run != None:
         wandb.finish()
