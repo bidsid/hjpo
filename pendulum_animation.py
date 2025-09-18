@@ -53,6 +53,7 @@ class FigureSwitcher:
         self.index = (self.index - 1) % len(self.data)
         self.plot_current()
 
+
 def simulateWithDiffraxIntegration(ode, torque_calc, t_stop, dt, theta_initial, omega_initial, m, b, L, G, k, 
                                    umax, policy, run_name):
     t = jnp.arange(0, t_stop, dt)
@@ -82,7 +83,7 @@ def simulateWithDiffraxIntegration(ode, torque_calc, t_stop, dt, theta_initial, 
     animationFig.suptitle("Pendulum simulation animations")
     plt.subplots_adjust(bottom=0.25)
     time_ax = plt.axes([0.2, 0.1, 0.6, 0.03])
-    time_ax.text(0, 0, "time is ")
+    time_ax.text(0, 0, "Time elapsed: ")
 
     for i in range(numPlots):
         sol = diffeqsolve(
@@ -123,16 +124,21 @@ def simulateWithDiffraxIntegration(ode, torque_calc, t_stop, dt, theta_initial, 
             lines[i].set_data([0, xs[i][frame]], [0, ys[i][frame]])
             artists.append(lines[i])
             artists.append(traces[i])
+        time_ax.text(0, 0, f"Time elapsed: {times[frame]} seconds")
         return artists
     
-    ani = animation.FuncAnimation(animationFig, update, len(times), interval=t_stop, blit=True)
+    saveAnimatedFig(animationFig, update, times, interval=dt*1000, blit=True, vid_name=run_name)
+
+    return thetaLists, omegaLists, times
+
+def saveAnimatedFig(fig, updateFunc, times, interval, blit, vid_name):
+    ani = animation.FuncAnimation(fig, updateFunc, len(times), interval=int(interval), blit=blit)
     matplotlib.rcParams["animation.ffmpeg_path"] = imageio_ffmpeg.get_ffmpeg_exe()
     Writer = animation.writers['ffmpeg']
     writer = Writer(fps=15, metadata=dict(artist='Me'), bitrate=1800)
-    filename = f"E:\\usc sure\\hjpo\\{run_name}.mp4"
+    filename = f"E:\\usc sure\\hjpo\\{vid_name}.mp4"
     ani.save(filename=filename, writer=writer)
-    plt.close(fig=animationFig)
-
+    plt.close(fig=fig)
 
 
 
@@ -192,7 +198,7 @@ def simulateWithDiffraxIntegration(ode, torque_calc, t_stop, dt, theta_initial, 
     # ani = animation.FuncAnimation(
     #     fig, animate, len(theta), fargs=(theta, omega, times, energies, torques, x, y, ), interval=t_stop, blit=True)
 
-    plt.show()
+    # plt.show()
 
 if __name__ == "__main__":
     m = 1.0
